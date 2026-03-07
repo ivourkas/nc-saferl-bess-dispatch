@@ -1,0 +1,32 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+
+# Training artifacts and generated outputs
+outputs/
+*.npy
+*.h5
+*.ckpt
+*.log
+
+# External dataset (kept in its own source repository)
+RTS-GMLC/
+
+# Internal documentation assets
+*.pdf
+*.ppt
+*.pptx
+*.md
+!/README.md
+make_pptx.py
