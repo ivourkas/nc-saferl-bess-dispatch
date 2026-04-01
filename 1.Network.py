@@ -567,6 +567,8 @@ print(f"  Bus mapping saved to: {mapping_path}")
 
 print(f"\n{'=' * 70}")
 print("STEP 1 COMPLETE")
+print(f"  Network: {len(net.bus)} buses | {len(net.line)} lines | "
+      f"{len(net.trafo)} trafos | {len(net.gen)+1} generators")
 print("Next: Step 2 - Pre-compute LMPs for all 8,784 hours")
 print("=" * 70)
 

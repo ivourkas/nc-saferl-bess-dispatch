@@ -9,23 +9,16 @@ from the research plan.
 
 ENVIRONMENT SPECIFICATION
 --------------------------
-State  (33-dim):
+State  (34-dim):
   [0]       SoC / E_cap                      (normalized SoC)
   [1]       LMP_k,t / LMP_NORM               (current LMP at BESS bus)
   [2..25]   LMP_k,{t-1..t-24} / LMP_NORM     (24-hour LMP history)
   [26]      total_system_PV_t / PV_MAX       (system-wide PV output)
-  [27..30]  deg_seg occupancy [d1,d2,d3,d4] (fraction full per segment)
-  [31]      p_lo / P_MAX                     (safety-layer lower bound, in [-1,0])
-  [32]      p_hi / P_MAX                     (safety-layer upper bound, in [0,1])
-  Line loadings removed (120 dims): the safety-layer projection already
-  distills network constraints into [p_lo, p_hi] bounds; the 120 raw
-  loading values added noise with no marginal predictive value.
-  Calendar sin/cos features removed: the 24-h LMP history encodes
-  diurnal/seasonal patterns implicitly.
-  p_lo/p_hi added (2 dims): explicitly expose the current feasible
-  dispatch range to both actor and critic. Speeds up learning by
-  eliminating the need to infer feasibility bounds from SoC+network
-  state alone. Consistent with research plan Section 5.1.
+  [27]      step_in_ep / EPS_LEN             (elapsed fraction of 168-step episode)
+  [28..31]  deg_seg occupancy [d1,d2,d3,d4] (fraction full per segment)
+  [32]      p_lo / P_MAX                     (safety-layer lower bound, in [-1,0])
+  [33]      p_hi / P_MAX                     (safety-layer upper bound, in [0,1])
+ 
 
 Action (1-dim):
   Continuous in [-1, +1], linearly rescaled to [-P_MAX, +P_MAX] MW.
@@ -73,11 +66,7 @@ Marginal cost per MWh extracted from battery at segment j:
               = R_per_kwh * 1000 * J * delta_phi / eta_dis  [$/MWh extracted]
   (Breakeven sell LMP = c_j / eta_dis, since energy delivered = eta_dis * e_from_batt)
 
-Code parameters (R=100 $/kWh, eta_dis=0.95, J=4)  [2026 BNEF cost estimate]:
-  c_1 = $13.23/MWh  (breakeven $13.93 -- profitable ~25%+ of hours at bus 111)
-  c_2 = $40.80/MWh  (breakeven $42.95 -- bus 111 LMP_max ~$82/MWh: profitable at peak hours)
-  c_3 = $69.02/MWh  (breakeven $72.65 -- below bus 111 LMP_max: profitable at peak-of-peak hours)
-  c_4 = $97.59/MWh  (breakeven $102.73 -- above bus 111 LMP_max; never profitable)
+
 
   SOC_INIT = 87.5 MWh places the battery mid-segment-1 at reset.
   The agent has 12.5 MWh of profitable discharge capacity immediately.
@@ -90,14 +79,11 @@ Economics at bus 111 (annual LMP analysis):
   the round-trip breakeven (~$24/MWh), the segment-2 breakeven ($42.95/MWh), and
   the segment-3 breakeven ($72.65/MWh) at peak congestion hours.
 
-  Round-trip breakeven: lmp_lo/eta_rt + c_1/eta_dis.
-  Charging at p25 LMP (~$9/MWh): 9/0.9025 + 14.09 ≈ $24.06/MWh sell needed.
-  Hours with LMP > $24/MWh: approx 10-15% of converged hours at bus 111.
+  Round-trip breakeven: lmp_ch/eta_rt + c_1/eta_dis.
+  Actual p25 LMP at bus 111 = $4.43/MWh (from precomputed data):
+    4.43/0.9025 + 13.23/0.95 ≈ $18.84/MWh sell needed.
+  Hours with LMP > $18.84/MWh: approx 15-20% of converged hours at bus 111.
 
-  Contrast: bus 306 (LMP_max=$94, rho=0.253) appears more attractive but
-  PTDF constraints block charging 74.7% of hours; arbitrage degenerates to
-  one-shot discharge. Bus 111 is the baseline for demonstrating NC-SafeRL.
-  Bus 306 is the pathological counter-example (Section 5.3 of the paper).
 
   R=$100/kWh reflects 2026 Li-ion pack costs (BNEF 2025 Battery Price Survey).
   To adjust difficulty, change BESS_R_PER_KWH:
@@ -227,7 +213,7 @@ class BESSEnv(gym.Env):
     Parameters
     ----------
     bess_bus_rts : int
-        RTS bus ID for BESS deployment (default: 306)
+        RTS bus ID for BESS deployment (default: 111)
     p_max_mw : float
         Battery power rating [MW]
     e_cap_mwh : float
@@ -298,9 +284,11 @@ class BESSEnv(gym.Env):
         self._load_data(bess_bus_rts)
 
         # --- Gymnasium spaces ---
-        # State: 33-dimensional continuous (line loadings + calendar features removed,
-        # p_lo/p_hi safety bounds added as 2 explicit dims)
-        n_obs = 1 + 1 + 24 + 1 + j_deg + 2          # = 33
+        # State: 34-dimensional continuous. Along with SoC, LMP signals, PV,
+        # degradation occupancy, and explicit safety bounds, we expose the
+        # within-episode progress so the finite-horizon policy can adapt near
+        # the 168-step terminal boundary.
+        n_obs = 1 + 1 + 24 + 1 + 1 + j_deg + 2      # = 34
         self.observation_space = spaces.Box(
             low=-np.ones(n_obs, dtype=np.float32),
             high=np.ones(n_obs, dtype=np.float32),
@@ -478,7 +466,7 @@ class BESSEnv(gym.Env):
 
         Returns
         -------
-        obs : np.ndarray, shape (33,)
+        obs : np.ndarray, shape (34,)
         info : dict with episode start info
         """
         super().reset(seed=seed)
@@ -523,7 +511,7 @@ class BESSEnv(gym.Env):
 
         Returns
         -------
-        obs       : np.ndarray (33,)
+        obs       : np.ndarray (34,)
         reward    : float      [scaled $]
         terminated: bool       (episode done, always at step 168)
         truncated : bool       (always False -- no timeout)
@@ -737,23 +725,24 @@ class BESSEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         """
-        Build the 33-dimensional state vector at the current timestep.
+        Build the 34-dimensional state vector at the current timestep.
 
         Layout:
           [0]       SoC / E_cap                     (normalized, 0..1)
           [1]       LMP_k,t / LMP_NORM              (roughly 0..1, can be negative)
           [2..25]   LMP history {t-1..t-24} / LMP_NORM  (24 values)
           [26]      pv_total / PV_MAX               (0..1)
-          [27..30]  deg segment occupancy           (4 values, 0..1 per segment)
-          [31]      p_lo / P_MAX                   (safety lower bound, in [-1, 0])
-          [32]      p_hi / P_MAX                   (safety upper bound, in [0, 1])
+          [27]      step_in_ep / EPS_LEN            (elapsed episode fraction)
+          [28..31]  deg segment occupancy           (4 values, 0..1 per segment)
+          [32]      p_lo / P_MAX                    (safety lower bound, in [-1, 0])
+          [33]      p_hi / P_MAX                    (safety upper bound, in [0, 1])
 
         p_lo/p_hi expose the current feasible dispatch window directly to the
         actor and critic, eliminating the need to infer it from SoC + network
         state alone.  They are computed from the current SoC and baseline line
         flows without any extra OPF call.
 
-        Returns np.ndarray of shape (33,) dtype float32, clipped to [-1, 1].
+        Returns np.ndarray of shape (34,) dtype float32, clipped to [-1, 1].
         """
         t = self.global_t
 
@@ -770,6 +759,9 @@ class BESSEnv(gym.Env):
         # -- System PV (proxy for renewable output and time-of-day) --
         pv_norm = float(self.pv_total[t]) / max(self.pv_max, 1.0) if t < 8784 else 0.0
 
+        # -- Episode progress (helps the finite-horizon policy manage terminal SoC) --
+        step_norm = float(self.step_in_ep) / max(float(self.EPS_LEN), 1.0)
+
         # -- Degradation segment occupancy (tells agent which cost tier is active) --
         seg_occ = self._get_seg_occupancy()   # (J,) in [0, 1]
 
@@ -785,10 +777,11 @@ class BESSEnv(gym.Env):
             [lmp_norm],          # 1
             lmp_hist_norm,       # 24
             [pv_norm],           # 1
+            [step_norm],         # 1
             seg_occ,             # J (4)
             [p_lo_norm],         # 1
             [p_hi_norm],         # 1
-        ]).astype(np.float32)    # total: 33
+        ]).astype(np.float32)    # total: 34
 
         # Clip to valid range (handles minor numerical overflows)
         return np.clip(obs, -1.0, 1.0)
@@ -841,7 +834,7 @@ class BESSEnv(gym.Env):
             )
         lines += [
             "",
-            f"  State dim:         {self.observation_space.shape[0]}  (SoC+LMP+hist24+PV+segs4+p_lo+p_hi)",
+            f"  State dim:         {self.observation_space.shape[0]}  (SoC+LMP+hist24+PV+step+segs4+p_lo+p_hi)",
             f"  Action dim:        {self.action_space.shape[0]}",
             f"  Episode length:    {self.EPS_LEN} steps (1 week)",
             f"  Reward scale:      {self.RWD_SCALE} (raw $/h -> scaled units)",
@@ -911,8 +904,8 @@ def validate_env(n_episodes: int = 5, verbose: bool = True) -> Dict[str, Any]:
     for k, v in lmp_stats.items():
         print(f"  {k:6s}: ${v:.2f}/MWh")
 
-    # Check spaces (obs dim = 33: 1+1+24+1+4+2, p_lo/p_hi added)
-    assert env.observation_space.shape == (33,), "Wrong obs shape"
+    # Check spaces (obs dim = 34: 1+1+24+1+1+4+2, step_in_ep and p_lo/p_hi added)
+    assert env.observation_space.shape == (34,), "Wrong obs shape"
     assert env.action_space.shape == (1,), "Wrong action shape"
     print(f"\nSpaces OK: obs={env.observation_space.shape}, action={env.action_space.shape}")
 

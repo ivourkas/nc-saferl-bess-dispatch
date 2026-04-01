@@ -20,7 +20,7 @@ violation, yet the RL training operates on the *projected* feasible action.
 ARCHITECTURE
 ------------
   ReplayBuffer          Circular numpy buffer (200 k transitions, ~25 MB RAM)
-  SquashedGaussianActor MLP 31 -> [256, 256] -> (mu, log_std), tanh squash
+  SquashedGaussianActor MLP 34 -> [256, 256] -> (mu, log_std), tanh squash
   TwinQCritic           Two Q-networks in one model, min(Q1, Q2) for targets
   SACAgent              Wires all pieces; @tf.function for all gradient steps
   PerfectForesightLP    scipy linprog oracle (no network constraints) for benchmark
@@ -34,9 +34,10 @@ TRAINING PROTOCOL
 
 HYPERPARAMETERS (HP dict)
 -------------------------
-  gamma = 0.99   tau = 0.005   lr = 3e-4  (actor, critic, alpha)
-  batch_size = 256   buffer_size = 200 000
-  target_entropy = -1.0   alpha_min = 0.0005  (automatic entropy tuning)
+  gamma = 0.99   tau = 0.005   lr = 3e-4   alpha_lr = 1e-4
+  batch_size = 256   buffer_size = 200 000   n_step = 8
+  target_entropy_scale = -0.75   init_alpha = 0.03   alpha_min = 0.0005
+  proj_lambda = 0.01   lp_warmstart_steps = 10 000   warmstart_bc_steps = 750
 
 OUTPUTS
 -------
@@ -45,8 +46,8 @@ OUTPUTS
 
 FRAMEWORK
 ---------
-  TensorFlow 2.10 (CPU-only; PyTorch not available in this environment)
-  CPU threads set to 4 (inter- and intra-op parallelism).
+  TensorFlow 2.16.2 + tensorflow-metal 1.2.0 (Apple Silicon GPU via Metal API).
+  Falls back to CPU automatically if Metal plugin is not installed.
   3.BESSEnvironment imported via importlib (filename starts with digit).
 """
 
@@ -62,13 +63,16 @@ import importlib.util
 from collections import deque   # used by run_episode_collect for N-step window
 import numpy as np
 
-# -- TensorFlow (CPU-only, Windows, TF 2.10) --
+# -- TensorFlow (Apple Silicon / Metal GPU) --
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"          # suppress TF INFO logs
 import tensorflow as tf
 
-# Set CPU parallelism before any computation
-tf.config.threading.set_inter_op_parallelism_threads(4)
-tf.config.threading.set_intra_op_parallelism_threads(4)
+# Verify Metal GPU is available; fall back to CPU gracefully
+_gpus = tf.config.list_physical_devices("GPU")
+if _gpus:
+    print(f"[TF] Metal GPU detected: {[g.name for g in _gpus]}")
+else:
+    print("[TF] No GPU found — running on CPU")
 
 from scipy.optimize import linprog
 
@@ -96,85 +100,38 @@ HP = {
     "gamma":          0.99,       # discount factor
     "tau":            0.005,      # target network soft-update rate
     "lr":             3e-4,       # learning rate (actor, critic)
-    "alpha_lr":       3e-4,       # temperature learning rate (SAC-v2 Eq. 18)
+    "alpha_lr":       1e-4,       # slower alpha updates: avoids early collapse
     "hidden_dim":     256,        # hidden layer width
-    "hidden_layers":  2,          # number of hidden layers
-    # Entropy
-    # target_entropy = target_entropy_scale * act_dim  (here: scale * 1 = scale).
-    # Auto-alpha tuning (SAC 2019) drives alpha toward the equilibrium where
-    # E[log_pi(a|s)] = -target_entropy_scale.
-    #
-    # SAC 2019 paper default: -act_dim = -1.0 for a 1-D action space.
-    #
-    # With alpha_min=0.0005 as a hard floor (see below), -1.0 is now SAFE:
-    # Run 6 failed because alpha collapsed to 0.0001 (alpha_min didn't exist
-    # then). alpha_min clamps log_alpha >= log(0.0005) = -7.6, preventing
-    # the divergence regardless of how concentrated the policy becomes.
-    #
-    # -1.0 is preferred over -0.5 for cold-start training (no LP warm-start):
-    # A random policy has E[log_pi] ≈ -1.4, so the auto-alpha gradient
-    # -(log_pi + target_entropy) = -(-1.4 - 1.0) = +2.4 pushes alpha UP,
-    # maintaining high exploration pressure throughout early SAC episodes.
-    # With -0.5 the same gradient is only +1.9 — less exploration. Higher
-    # sustained alpha lets the agent discover profitable timing patterns
-    # from random exploration without LP bootstrapping.
-    "target_entropy_scale": -1.0,
+    "hidden_layers":  2,          # number of hidden layers    
+    "target_entropy_scale": -0.75,
     # Buffer & batch
-    "buffer_size":    200_000,    # doubled from 100k: retains good experiences
-                                  # longer as the policy improves. At 100k the
-                                  # buffer turned over every ~600 eps, meaning
-                                  # beneficial ep1500 transitions were overwritten
-                                  # before they could stabilise the critic.
+    "buffer_size":    200_000,    
     "batch_size":     256,
     # Minimum buffer fill before ANY gradient update begins.
     # Starting at batch_size=256 (≈1 episode) caused the critic to overfit
-    # catastrophically to near-identical early transitions (critic_loss=2360
-    # at ep500 in previous runs). 2000 transitions ≈ 12 random episodes,
+    # catastrophically to near-identical early transitions.
+    # 2000 transitions ≈ 12 random episodes,
     # providing enough diversity for stable initial TD targets.
     "min_buffer_fill": 2_000,
     # LP Expert Warm-Start (fills buffer before SAC training begins).
     # 10 000 transitions = 5% of total buffer capacity (200 k).
-    #
-    # Design rationale (vs RLBattEM4, Rasic et al. 2025):
-    #   RLBattEM4 pre-fills 62.5% of their buffer (~50 k transitions) using
-    #   heuristic rule-based actions + 2-step MPC.  We cannot match that scale
-    #   directly because our LP oracle is restricted to SoC ∈ [75, 90] MWh
-    #   (segment 1 only) to avoid cost-mismatch poisoning (see PerfectForesightLP
-    #   docstring).  A 62.5%-fill of segment-1-only trajectories would severely
-    #   bias the replay buffer and suppress exploration of segments 2–3 during
-    #   the rare high-LMP hours when they become profitable.
-    #
-    #   10 000 steps (≈ 60 LP episodes) is a pragmatic middle ground:
-    #     • Enough to prevent the idle/discharge-only cold-start trap
-    #       (observed without warm-start in run 7).
-    #     • Small enough (5% of buffer) that SAC-collected transitions rapidly
-    #       dilute expert data, allowing unbiased exploration within 200 episodes.
-    #     • PER then naturally re-prioritises any remaining expert transitions
-    #       whose TD error is still high, giving them extra replay without
-    #       artificially fixing their proportion of the buffer.
-    #
-    # Reference: Rasic et al. (2025) "Safe RL for BESS Participation in the
-    #   Imbalance Settlement," arXiv:2503.xxxxx, §IV-B (warm-start ablation).
+    
     "lp_warmstart_steps": 10_000,
     # Optional actor behavior-cloning pretrain on LP warm-start transitions.
     # Warm-start transitions directly supervise the policy before on-policy SAC
     # updates begin, making the expert data useful for BOTH critic and actor.
-    "warmstart_bc_steps": 1_500,
+    "warmstart_bc_steps": 750,
     "warmstart_bc_batch_size": 256,
-    # Anticipatory penalty: penalises ||a_raw - a_projected||^2 in actor loss.
-    # This provides non-zero gradient signal for the ~80% of steps where the
-    # safety projection clips the actor output (clip subgradient = 0 there).
-    # Equivalent to CVXPYLayers for our 1-D linear QP: clip IS the exact
-    # differentiable projection; the penalty adds smooth signal at boundaries.
-    # Scale: per-step reward is O(0.001), so penalty must be the same order.
-    # Previous value of 0.1 was 100× too large, dominating the Q-signal.
-    "proj_lambda":    0.001,      # weight of anticipatory projection penalty
+    
+    # Anticipatory projection penalty: pushes the actor toward naturally feasible
+    # outputs so the Q-gradient (zero when clipped) is supplemented by a direct
+    # feasibility gradient at the ~86% of steps where PTDF constraints bind.
+    "proj_lambda":    0.01,       # non-zero restores gradient under tight PTDF constraints
     # N-step return horizon.
     # Buffer stores G_t^N = sum_{k=0}^{N-1} gamma^k * r_{t+k}; critic
     # bootstraps with gamma^N. N=8 spans one-third of a daily price cycle,
     # directly bridging the credit-assignment gap between charging (negative
-    # immediate reward) and profitable discharge 4-12 h later. Compatible
-    # with SAC: only the critic target changes; actor/alpha updates unchanged.
+    # immediate reward) and profitable discharge 4-12 h later.
     "n_step":         8,
     # Initial entropy coefficient alpha.
     # SAC default log_alpha=0.0 → alpha=1.0. With REWARD_SCALE=1e-3 our
@@ -182,32 +139,23 @@ HP = {
     # by ~500× in early training, forcing pure-entropy optimisation for
     # 100+ episodes before alpha decays. alpha=0.01 starts the entropy
     # term at the same order of magnitude as per-step rewards from ep 1.
-    "init_alpha":     0.01,
+    # Slightly higher start value to preserve exploration while the critic is
+    # still forming its first profitable arbitrage estimates.
+    "init_alpha":     0.03,
     # Hard lower bound on alpha (prevents critic divergence from alpha → 0).
     # Without this, auto-alpha can drive log_alpha → -∞ when the policy
     # over-concentrates (e.g. after policy collapses onto a local optimum).
-    # 0.0005 = 0.5 × REWARD_SCALE ensures the entropy term always contributes
-    # at least ~0.1% of Q-values, keeping minimum exploration pressure active.
+   
     "alpha_min":      0.0005,
     # Training schedule
     "train_episodes": 5_000,      # SAC episodes (upper bound; early stopping
                                   # will halt before this if policy converges)
-    "eval_freq":      100,        # was 500; finer-grained checkpoint detection.
-                                  # The best policy can appear and disappear
-                                  # within a 500-ep window (run3/4 peak near
-                                  # ep1500, degraded by ep2000); 100-ep evals
-                                  # ensure we capture it.
-    # eval runs on ALL env.test_starts (~95 episodes) — no eval_episodes needed.
-    # Early stopping: halt if eval_mean does not improve by min_delta for
-    # `patience` consecutive evals. With eval_freq=100, patience=8 means
-    # 800 stagnant episodes before stopping.
-    "early_stop_patience":  12,   # 1200 eps stagnation before stop (was 8=800 eps).
-                                  # Run 5 plateau lasted ~1500 eps; extended patience
-                                  # allows the policy to continue improving through
-                                  # slow-progress phases.
-    "early_stop_min_delta": 0.001,# min improvement to reset patience (was 0.005).
-                                  # Run 5: ep3300 (+0.0008) and ep3800 (+0.0023)
-                                  # were genuine improvements ignored by 0.005.
+    "eval_freq":      100,       
+    
+
+    "early_stop_patience":  12,   
+    
+    "early_stop_min_delta": 0.001,# min improvement to reset patience 
     # Reproducibility
     "seed":           42,
 }
@@ -289,16 +237,16 @@ class ReplayBuffer:
     Circular numpy replay buffer for off-policy experience with Prioritized
     Experience Replay (PER).
 
-    Memory layout (200 k transitions, obs_dim=33, act_dim=1):
-      obs        : (200k, 33) float32  ~26.4 MB
-      next_obs   : (200k, 33) float32  ~26.4 MB
+    Memory layout (200 k transitions, obs_dim=34, act_dim=1):
+      obs        : (200k, 34) float32  ~27.2 MB
+      next_obs   : (200k, 34) float32  ~27.2 MB
       act        : (200k,  1) float32   ~0.8 MB   <- projected action (a_safe)
       rew        : (200k,  1) float32   ~0.8 MB
       done       : (200k,  1) float32   ~0.8 MB
       bounds     : (200k,  2) float32   ~1.6 MB   <- [p_lo, p_hi] at s_t
       next_bounds: (200k,  2) float32   ~1.6 MB   <- [p_lo, p_hi] at s_{t+N}
       SumTree    : (400k,)   float64   ~3.2 MB
-    Total: ~58 MB
+    Total: ~63 MB
 
     bounds / next_bounds semantics (Convention B)
     ---------------------------------------------
@@ -531,15 +479,20 @@ class ReplayBuffer:
 
 class SquashedGaussianActor(tf.keras.Model):
     """
-    Stochastic actor with tanh-squashed Gaussian policy.
+    Stochastic actor with standard tanh-squashed Gaussian policy.
 
-    Architecture: obs (31) -> Dense(256, relu) -> Dense(256, relu)
-                                                -> mu (1)
-                                                -> log_std (1)   [clipped to -20..2]
+    The network outputs a raw action a = tanh(z) in (-1, 1).  The safety
+    projection clip(a, p_lo, p_hi) is applied OUTSIDE the actor (in the
+    actor-update step), ensuring:
+      - Full Q-gradient flow: ∂a/∂θ = sech²(z) × ∂z/∂θ, independent of
+        interval width (no half_range scaling that vanishes under tight PTDF
+        constraints).
+      - proj_lambda × ||a - clip(a)||^2 restores gradient at the ~86% of
+        steps where the clip would otherwise zero out ∂Q/∂θ.
 
-    Output: action = tanh(mu + std * eps),  eps ~ N(0, I)
-    Log-prob correction for squashing:
-        log pi(a|s) = log N(z; mu, std) - sum_i log(1 - tanh(z_i)^2 + 1e-6)
+    Safety projection is the caller's responsibility: the actor-update step
+    clips act to [p_lo, p_hi] and applies proj_lambda to keep the raw action
+    naturally within the feasible interval over time.
     """
 
     def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int = 256):
@@ -551,6 +504,13 @@ class SquashedGaussianActor(tf.keras.Model):
         self.mu_layer      = tf.keras.layers.Dense(act_dim)
         self.log_std_layer = tf.keras.layers.Dense(act_dim)
 
+    def _distribution_params(self, obs: tf.Tensor):
+        """Return Gaussian parameters for the latent normalized action."""
+        h = self.fc2(self.fc1(obs))
+        mu = self.mu_layer(h)
+        log_std = tf.clip_by_value(self.log_std_layer(h), LOG_STD_MIN, LOG_STD_MAX)
+        return mu, log_std
+
     def call(self, obs):
         """
         Stochastic forward pass (used during training).
@@ -561,17 +521,15 @@ class SquashedGaussianActor(tf.keras.Model):
 
         Returns
         -------
-        action   : tf.Tensor, shape (batch, act_dim)  in (-1, 1)
-        log_pi   : tf.Tensor, shape (batch, 1)         log probability
+        action : tf.Tensor, shape (batch, act_dim)  in (-1, 1)  — raw tanh output
+        log_pi : tf.Tensor, shape (batch, 1)  — log-prob under the squashed Gaussian
         """
-        h = self.fc2(self.fc1(obs))
-        mu      = self.mu_layer(h)
-        log_std = tf.clip_by_value(self.log_std_layer(h), LOG_STD_MIN, LOG_STD_MAX)
-        std     = tf.exp(log_std)
+        mu, log_std = self._distribution_params(obs)
+        std = tf.exp(log_std)
 
         # Reparameterization trick
         eps = tf.random.normal(tf.shape(mu))
-        z   = mu + std * eps
+        z = mu + std * eps
 
         # Log probability under Gaussian (pre-squashing)
         log_pi_normal = (
@@ -587,16 +545,16 @@ class SquashedGaussianActor(tf.keras.Model):
         )
 
         log_pi = log_pi_normal - squash_correction
-        action = tf.tanh(z)
+        action = tf.tanh(z)   # raw action in (-1, 1); projection applied in actor-update step
         return action, log_pi
 
     def get_deterministic_action(self, obs):
         """
-        Deterministic forward pass: action = tanh(mu).
+        Deterministic forward pass. Returns tanh(mu) in (-1, 1).
         Used during evaluation (no exploration noise).
+        Projection to the feasible interval is the caller's responsibility.
         """
-        h  = self.fc2(self.fc1(obs))
-        mu = self.mu_layer(h)
+        mu, _ = self._distribution_params(obs)
         return tf.tanh(mu)
 
 
@@ -612,7 +570,7 @@ class TwinQCritic(tf.keras.Model):
 
     def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int = 256):
         super().__init__()
-        in_dim = obs_dim + act_dim
+       
 
         # Q1 network
         self.q1_fc1 = tf.keras.layers.Dense(hidden_dim, activation="relu")
@@ -659,7 +617,7 @@ class SACAgent:
 
     Parameters
     ----------
-    obs_dim : int   -- observation space dimensionality (31)
+    obs_dim : int   -- observation space dimensionality (34)
     act_dim : int   -- action space dimensionality (1)
     hp      : dict  -- hyperparameter dict (see HP at top of file)
     """
@@ -690,10 +648,7 @@ class SACAgent:
 
         # --- Optimizers (same lr for all three, gradient clipping) ---
         # global_clipnorm=1.0 clips ALL parameter gradients jointly so their
-        # combined L2-norm is ≤1.0. The previous per-variable clipnorm=1.0
-        # allowed the total gradient norm to be O(sqrt(N_params)) ≈ 300× larger
-        # than intended, providing insufficient protection against the TD-error
-        # spikes (critic_loss=7.35) seen at ep3000 in previous training runs.
+        # combined L2-norm is ≤1.0. 
         lr = hp["lr"]
         alpha_lr = float(hp.get("alpha_lr", lr))
         self.actor_opt  = tf.keras.optimizers.Adam(lr, global_clipnorm=1.0)
@@ -707,8 +662,7 @@ class SACAgent:
         # are O(0.001); alpha=1.0 overwhelms the Q-signal by ~500× for the
         # first 100 episodes, causing the actor to optimise pure entropy and
         # the alpha decay mechanism to crash alpha to ~0.0003 before the critic
-        # converges.  Starting at 0.01 keeps the entropy and Q terms at the
-        # same order of magnitude from episode 1.
+        # converges.  
         _init_alpha = float(hp.get("init_alpha", 0.01))
         self.log_alpha      = tf.Variable(
             math.log(_init_alpha), trainable=True, dtype=tf.float32
@@ -717,8 +671,6 @@ class SACAgent:
             hp["target_entropy_scale"] * float(act_dim), dtype=tf.float32
         )
         # Hard lower bound: alpha never falls below alpha_min.
-        # Stored as a TF constant so _update_alpha (@tf.function) can reference
-        # it without Python-side retracing on every call.
         _alpha_min = float(hp.get("alpha_min", 0.0005))
         self._log_alpha_min = tf.constant(math.log(_alpha_min), dtype=tf.float32)
 
@@ -794,7 +746,7 @@ class SACAgent:
                       δ_i = 0.5*(|Q1_i - y_i| + |Q2_i - y_i|)
                       Computed from Q values BEFORE the weight update (standard PER).
         """
-        # Sample next action from current policy (no gradient through actor here)
+        # Sample next action from the stochastic policy.
         next_act, next_log_pi = self.actor(next_obs)
 
         # Project next action to next-state safety bounds (Convention B fix)
@@ -811,8 +763,6 @@ class SACAgent:
 
         # IS-weighted critic gradient step.
         # Per-sample loss: l_i = 0.5 * w_i * [(Q1_i - y)^2 + (Q2_i - y)^2]
-        # Previous code omitted the 0.5, doubling the effective critic LR
-        # and amplifying the instability that caused critic crash at ep1200.
         with tf.GradientTape() as tape:
             q1, q2 = self.critic([obs, act])
             per_sample_loss = 0.5 * is_weights * (
@@ -839,29 +789,28 @@ class SACAgent:
         Compute and apply actor gradients.
 
         Convention B (differentiable projection, no CVXPYLayers needed):
-          1. Actor proposes a_raw in (-1, 1).
+          1. Actor proposes a_raw = tanh(z) in (-1, 1).
           2. Clip to stored safety bounds [p_lo, p_hi] -> a_proj.
-             tf.clip_by_value is differentiable: grad = 1 (unconstrained)
-             or 0 (clipped).  For our 1-D linear QP this IS the exact KKT
-             gradient — identical to what CVXPYLayers would produce.
+             tf.clip_by_value: grad = 1 when in bounds, 0 when clipped.
+             For this 1-D linear QP this IS the exact KKT gradient.
           3. Q is evaluated at a_proj (consistent with critic training).
           4. Anticipatory penalty ||a_raw - a_proj||^2 restores non-zero
-             gradient signal at the 88% of steps where clip zeros it out,
-             pushing the actor toward naturally feasible outputs.
+             gradient at the ~86% of steps where PTDF binding makes the
+             clip active (where Q-gradient alone would be zero).
 
-        Loss = E[alpha * log_pi(a_raw|s)          (entropy on raw dist.)
-                - min(Q1,Q2)(s, a_proj)            (value at projected act.)
+        Loss = E[alpha * log_pi(a_raw|s)           (entropy on raw dist.)
+                - min(Q1,Q2)(s, a_proj)             (value at projected act.)
                 + proj_lambda * ||a_raw-a_proj||^2] (anticipatory penalty)
         """
         p_lo = bounds[:, :1]   # (batch, 1)  normalised lower bound
         p_hi = bounds[:, 1:]   # (batch, 1)  normalised upper bound
 
         with tf.GradientTape() as tape:
-            act, log_pi = self.actor(obs)                              # a_raw
-            act_proj = tf.clip_by_value(act, p_lo, p_hi)              # a_proj
-            q1, q2 = self.critic([obs, act_proj])                     # Q(s, a_proj)
+            act, log_pi = self.actor(obs)                              # a_raw in (-1, 1)
+            act_proj = tf.clip_by_value(act, p_lo, p_hi)              # project to feasible interval
+            q1, q2 = self.critic([obs, act_proj])                     # Convention B: Q at projected action
             min_q   = tf.minimum(q1, q2)
-            proj_pen = tf.reduce_mean(tf.square(act - act_proj))      # anticipatory
+            proj_pen = tf.reduce_mean(tf.square(act - act_proj))      # should stay ~0
             actor_loss = (tf.reduce_mean(self.alpha * log_pi - min_q)
                           + self.proj_lambda * proj_pen)
 
@@ -876,7 +825,7 @@ class SACAgent:
         """
         One behavior-cloning gradient step on expert actions.
 
-        Uses deterministic policy output tanh(mu(s)) and MSE loss:
+        Uses deterministic feasible policy output and MSE loss:
           L_BC = E[ ||a_det(s) - a_expert||^2 ].
         """
         with tf.GradientTape() as tape:
@@ -897,12 +846,11 @@ class SACAgent:
         """
         Update log_alpha to match target entropy.
 
-        SAC-v2 dual objective (paper Eq. 18):
-          J(alpha) = E[-alpha * (log_pi + H_target)]
+        Practical log_alpha surrogate for the SAC temperature update.
 
-        alpha is parameterized as exp(log_alpha) for positivity.
-        This keeps the update consistent with Eq. 18 while still optimizing
-        an unconstrained scalar variable.
+        The sign matches the Eq. 18 dual descent direction, while avoiding
+        the vanishing-gradient effect of alpha * (...) once alpha becomes
+        very small.
 
         After the gradient step a hard lower bound is enforced:
           log_alpha >= log(alpha_min)
@@ -914,7 +862,7 @@ class SACAgent:
             _, log_pi = self.actor(obs)
             # Stop gradient: log_pi is a constant label for alpha update
             alpha_loss = -tf.reduce_mean(
-                self.alpha * tf.stop_gradient(log_pi + self.target_entropy)
+                self.log_alpha * tf.stop_gradient(log_pi + self.target_entropy)
             )
 
         grads = tape.gradient(alpha_loss, [self.log_alpha])
@@ -1498,7 +1446,7 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
-    obs_dim = env.observation_space.shape[0]   # 33 (SoC+LMP+hist24+PV+segs4+p_lo+p_hi)
+    obs_dim = env.observation_space.shape[0]   # 34 (SoC+LMP+hist24+PV+step+segs4+p_lo+p_hi)
     act_dim = env.action_space.shape[0]        # 1
 
     buffer = ReplayBuffer(obs_dim, act_dim, hp["buffer_size"])
@@ -1626,9 +1574,6 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
 
             # --- Checkpoint: save whenever this is the all-time best eval ---
             # Decoupled from patience so we never miss the true global maximum.
-            # Run 5 bug: gating save on min_delta caused ep3300 (+0.1486) and
-            # ep3800 (+0.1501) to be skipped despite being genuine improvements
-            # over the saved checkpoint at ep3100 (+0.1478).
             if eval_m["eval_mean"] > best_eval:
                 best_eval = eval_m["eval_mean"]
                 best_ep   = ep

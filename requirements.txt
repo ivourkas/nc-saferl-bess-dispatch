@@ -3,4 +3,7 @@ pandas>=2.0
 scipy>=1.10
 pandapower>=2.14
 gymnasium>=0.29
-tensorflow>=2.10
+# Apple Silicon (arm64) — use tensorflow-macos + Metal GPU plugin
+# On other platforms, replace with: tensorflow>=2.12
+tensorflow-macos>=2.12
+tensorflow-metal>=1.0
