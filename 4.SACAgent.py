@@ -103,7 +103,10 @@ HP = {
     "alpha_lr":       1e-4,       # slower alpha updates: avoids early collapse
     "hidden_dim":     256,        # hidden layer width
     "hidden_layers":  2,          # number of hidden layers    
-    "target_entropy_scale": -0.75,
+    "target_entropy_scale": -2.0,    # was -0.75: too high for bang-bang LP oracle.
+                                     # With PTDF constraints forcing ±1 actions in 86% of hours,
+                                     # achievable entropy is O(-5) not O(-0.75).
+                                     # -2.0 is a reachable target that still preserves exploration.
     # Buffer & batch
     "buffer_size":    200_000,    
     "batch_size":     256,
@@ -147,6 +150,9 @@ HP = {
     # over-concentrates (e.g. after policy collapses onto a local optimum).
    
     "alpha_min":      0.0005,
+    # Hard upper bound on alpha (prevents runaway when log_pi > -target_entropy,
+    # which occurs after BC warmstart pushes policy to saturate tanh at ±1).
+    "alpha_max":      1.0,
     # Training schedule
     "train_episodes": 5_000,      # SAC episodes (upper bound; early stopping
                                   # will halt before this if policy converges)
@@ -673,6 +679,11 @@ class SACAgent:
         # Hard lower bound: alpha never falls below alpha_min.
         _alpha_min = float(hp.get("alpha_min", 0.0005))
         self._log_alpha_min = tf.constant(math.log(_alpha_min), dtype=tf.float32)
+        # Hard upper bound: alpha never exceeds alpha_max.
+        # Without this, BC warmstart (bang-bang LP oracle saturates tanh → log_pi > 0)
+        # causes alpha to explode exponentially, drowning the Q-signal.
+        _alpha_max = float(hp.get("alpha_max", 1.0))
+        self._log_alpha_max = tf.constant(math.log(_alpha_max), dtype=tf.float32)
 
         # Keras 3 tracks variables per optimizer on first apply_gradients().
         # BC pretrain may touch only a subset of actor params (mu head), so
@@ -753,6 +764,11 @@ class SACAgent:
         next_p_lo = next_bounds[:, :1]   # (batch, 1)
         next_p_hi = next_bounds[:, 1:]   # (batch, 1)
         next_act_proj = tf.clip_by_value(next_act, next_p_lo, next_p_hi)
+
+        # Clamp log_pi to prevent critic target corruption when tanh saturates.
+        # After BC warmstart, log_pi can be +5 to +8 (squash correction artifact).
+        # alpha * log_pi in the target would then be O(1000s) vs Q O(0.001).
+        next_log_pi = tf.clip_by_value(next_log_pi, -20.0, 2.0)
 
         # N-step target Q values (stop_gradient: treated as a constant label)
         q1_next, q2_next = self.critic_target([next_obs, next_act_proj])
@@ -868,7 +884,9 @@ class SACAgent:
         grads = tape.gradient(alpha_loss, [self.log_alpha])
         self.alpha_opt.apply_gradients(zip(grads, [self.log_alpha]))
         # Hard floor: clamp log_alpha from below so alpha >= alpha_min
-        self.log_alpha.assign(tf.maximum(self.log_alpha, self._log_alpha_min))
+        self.log_alpha.assign(
+            tf.clip_by_value(self.log_alpha, self._log_alpha_min, self._log_alpha_max)
+        )
         return alpha_loss
 
     def _soft_update_target(self) -> None:
@@ -1213,6 +1231,7 @@ def run_episode_collect(
 
     for _ in range(env.EPS_LEN):
         act = agent.act(obs, deterministic=False)   # shape (1,) in [-1, 1]
+        act = np.clip(act, -1.0, 1.0)              # guard against tanh float overflow
         next_obs, rew, terminated, truncated, info = env.step(act)
         done = terminated or truncated
 
@@ -1403,7 +1422,7 @@ def _run_evaluation(
         ep_return = 0.0
 
         for _ in range(env.EPS_LEN):
-            act = agent.act(obs, deterministic=True)
+            act = np.clip(agent.act(obs, deterministic=True), -1.0, 1.0)
             obs, rew, terminated, truncated, _ = env.step(act)
             ep_return += rew
             if terminated or truncated:
