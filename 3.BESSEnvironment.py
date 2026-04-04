@@ -9,7 +9,7 @@ from the research plan.
 
 ENVIRONMENT SPECIFICATION
 --------------------------
-State  (34-dim):
+State  (36-dim):
   [0]       SoC / E_cap                      (normalized SoC)
   [1]       LMP_k,t / LMP_NORM               (current LMP at BESS bus)
   [2..25]   LMP_k,{t-1..t-24} / LMP_NORM     (24-hour LMP history)
@@ -18,6 +18,11 @@ State  (34-dim):
   [28..31]  deg_seg occupancy [d1,d2,d3,d4] (fraction full per segment)
   [32]      p_lo / P_MAX                     (safety-layer lower bound, in [-1,0])
   [33]      p_hi / P_MAX                     (safety-layer upper bound, in [0,1])
+  [34]      day_of_week / 6.0               (0=day0 of year, periodic mod 7; captures
+                                             weekday/weekend LMP pattern invisible in
+                                             24h history alone)
+  [35]      system_load / SYSTEM_LOAD_MAX   (total 3-area MW demand; proxy for
+                                             load-driven price pressure beyond PV signal)
  
 
 Action (1-dim):
@@ -154,6 +159,10 @@ REWARD_SCALE     = 1e-3      # Scale rewards to O(1) for stable RL training
 # --- PTDF sensitivity threshold ---
 PTDF_THRESH      = 1e-5      # Lines with |PTDF| < thresh are treated as insensitive
 
+# --- System load normalization ---
+# RTS-GMLC 2020: peak 3-area combined load ~8900 MW. Use 9500 as conservative ceiling.
+SYSTEM_LOAD_MAX  = 9500.0    # [MW] normalization for system total load
+
 # --- Paths ---
 _HERE = os.path.dirname(os.path.abspath(__file__))
 OUTPUTS_DIR = os.path.join(_HERE, "outputs")
@@ -288,7 +297,7 @@ class BESSEnv(gym.Env):
         # degradation occupancy, and explicit safety bounds, we expose the
         # within-episode progress so the finite-horizon policy can adapt near
         # the 168-step terminal boundary.
-        n_obs = 1 + 1 + 24 + 1 + 1 + j_deg + 2      # = 34
+        n_obs = 1 + 1 + 24 + 1 + 1 + j_deg + 2 + 2   # = 36 (+day_of_week, +system_load)
         self.observation_space = spaces.Box(
             low=-np.ones(n_obs, dtype=np.float32),
             high=np.ones(n_obs, dtype=np.float32),
@@ -411,6 +420,19 @@ class BESSEnv(gym.Env):
 
         # Normalization constants from data
         self.pv_max = float(np.nanmax(self.pv_total))  # for state normalization
+
+        # --- System total load (sum of 3 RTS areas per hour) ---
+        # Loaded directly from the RTS-GMLC time-series CSV (no Step 2 re-run needed).
+        # Columns "1","2","3" are MW loads per area; sum gives system total.
+        _load_csv = os.path.join(
+            _HERE, "RTS-GMLC", "RTS_Data", "timeseries_data_files",
+            "Load", "DAY_AHEAD_regional_Load.csv",
+        )
+        import pandas as _pd
+        _load_df = _pd.read_csv(_load_csv)
+        self.system_load = (
+            _load_df["1"].values + _load_df["2"].values + _load_df["3"].values
+        ).astype(np.float32)[:self.lmps.shape[0]]   # trim to 8784 hours
 
         print(f"  Loaded Step 2 data: {self.lmps.shape[0]} hours, {self.lmps.shape[1]} buses")
         print(f"  BESS bus {bess_bus_rts} -> column {self.bess_col}")
@@ -736,13 +758,16 @@ class BESSEnv(gym.Env):
           [28..31]  deg segment occupancy           (4 values, 0..1 per segment)
           [32]      p_lo / P_MAX                    (safety lower bound, in [-1, 0])
           [33]      p_hi / P_MAX                    (safety upper bound, in [0, 1])
+          [34]      day_of_week / 6.0              (weekday index mod 7, captures
+                                                    weekday/weekend price pattern)
+          [35]      system_load / SYSTEM_LOAD_MAX  (3-area total MW demand)
 
         p_lo/p_hi expose the current feasible dispatch window directly to the
         actor and critic, eliminating the need to infer it from SoC + network
         state alone.  They are computed from the current SoC and baseline line
         flows without any extra OPF call.
 
-        Returns np.ndarray of shape (34,) dtype float32, clipped to [-1, 1].
+        Returns np.ndarray of shape (36,) dtype float32, clipped to [-1, 1].
         """
         t = self.global_t
 
@@ -772,6 +797,14 @@ class BESSEnv(gym.Env):
         p_lo_norm = p_lo / self.P_MAX   # in [-1, 0]
         p_hi_norm = p_hi / self.P_MAX   # in [0, 1]
 
+        # -- Day of week (weekday/weekend pattern invisible in 24h LMP history) --
+        # RTS-GMLC dataset starts Jan 1 2020 = Wednesday (weekday index 2).
+        # Offset +2 so index 0=Monday, consistent with standard convention.
+        day_of_week_norm = float(((t // 24) + 2) % 7) / 6.0
+
+        # -- System total load (3-area combined MW demand) --
+        load_norm = float(self.system_load[t]) / SYSTEM_LOAD_MAX if t < len(self.system_load) else 0.0
+
         obs = np.concatenate([
             [soc_norm],          # 1
             [lmp_norm],          # 1
@@ -781,7 +814,9 @@ class BESSEnv(gym.Env):
             seg_occ,             # J (4)
             [p_lo_norm],         # 1
             [p_hi_norm],         # 1
-        ]).astype(np.float32)    # total: 34
+            [day_of_week_norm],  # 1  NEW
+            [load_norm],         # 1  NEW
+        ]).astype(np.float32)    # total: 36
 
         # Clip to valid range (handles minor numerical overflows)
         return np.clip(obs, -1.0, 1.0)
@@ -834,7 +869,7 @@ class BESSEnv(gym.Env):
             )
         lines += [
             "",
-            f"  State dim:         {self.observation_space.shape[0]}  (SoC+LMP+hist24+PV+step+segs4+p_lo+p_hi)",
+            f"  State dim:         {self.observation_space.shape[0]}  (SoC+LMP+hist24+PV+step+segs4+p_lo+p_hi+dow+load)",
             f"  Action dim:        {self.action_space.shape[0]}",
             f"  Episode length:    {self.EPS_LEN} steps (1 week)",
             f"  Reward scale:      {self.RWD_SCALE} (raw $/h -> scaled units)",
