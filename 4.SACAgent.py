@@ -103,10 +103,13 @@ HP = {
     "alpha_lr":       1e-4,       # slower alpha updates: avoids early collapse
     "hidden_dim":     256,        # hidden layer width
     "hidden_layers":  2,          # number of hidden layers    
-    "target_entropy_scale": -2.0,    # was -0.75: too high for bang-bang LP oracle.
-                                     # With PTDF constraints forcing ±1 actions in 86% of hours,
-                                     # achievable entropy is O(-5) not O(-0.75).
-                                     # -2.0 is a reachable target that still preserves exploration.
+    "target_entropy_scale": -8.0,    # Calibrated to actual achievable entropy.
+                                     # After BC warmstart saturates tanh at ±1, log_pi ≈ +4 to +8.
+                                     # Target must be BELOW achievable entropy so alpha decays.
+                                     # With PTDF constraints binding 86% of hours (bang-bang policy),
+                                     # steady-state policy entropy ≈ -5 to -10.
+                                     # -8.0 allows alpha to decay from init while preserving
+                                     # enough entropy incentive to prevent premature convergence.
     # Buffer & batch
     "buffer_size":    200_000,    
     "batch_size":     256,
@@ -152,7 +155,9 @@ HP = {
     "alpha_min":      0.0005,
     # Hard upper bound on alpha (prevents runaway when log_pi > -target_entropy,
     # which occurs after BC warmstart pushes policy to saturate tanh at ±1).
-    "alpha_max":      1.0,
+    "alpha_max":      0.05,   # was 1.0: with reward_scale=0.001, alpha=1.0 is 20× too large.
+                              # Per-step rewards O(0.001); alpha × log_pi must stay same order.
+                              # 0.05 × log_pi(~5) = 0.25 >> per-step reward O(0.001-0.1) ✓
     # Training schedule
     "train_episodes": 5_000,      # SAC episodes (upper bound; early stopping
                                   # will halt before this if policy converges)
@@ -485,35 +490,79 @@ class ReplayBuffer:
 
 class SquashedGaussianActor(tf.keras.Model):
     """
-    Stochastic actor with standard tanh-squashed Gaussian policy.
+    Stochastic actor with structured state encoder + tanh-squashed Gaussian policy.
 
-    The network outputs a raw action a = tanh(z) in (-1, 1).  The safety
-    projection clip(a, p_lo, p_hi) is applied OUTSIDE the actor (in the
-    actor-update step), ensuring:
-      - Full Q-gradient flow: ∂a/∂θ = sech²(z) × ∂z/∂θ, independent of
-        interval width (no half_range scaling that vanishes under tight PTDF
-        constraints).
-      - proj_lambda × ||a - clip(a)||^2 restores gradient at the ~86% of
-        steps where the clip would otherwise zero out ∂Q/∂θ.
+    State is split into two streams with different inductive biases:
 
-    Safety projection is the caller's responsibility: the actor-update step
-    clips act to [p_lo, p_hi] and applies proj_lambda to keep the raw action
-    naturally within the feasible interval over time.
+      LMP stream  obs[1:26]  (25-dim: current LMP + 24h history)
+        → Conv1D(32 filters, kernel=4, stride=1, relu)
+        → GlobalAveragePooling1D
+        → Dense(32, relu)
+        → 32-dim temporal embedding
+
+      Scalar stream  obs[0] + obs[26:36]  (11-dim: SoC, PV, step, segs×4, p_lo, p_hi, DoW, load)
+        → Dense(32, relu)
+        → 32-dim scalar embedding
+
+      Concat (64-dim) → Dense(256, relu) → Dense(256, relu) → (mu, log_std)
+
+    Rationale:
+      - Conv1D on the LMP stream learns local temporal patterns (e.g., "prices
+        rose for 4 consecutive hours → discharge now") without storing an LSTM
+        hidden state, keeping training stable and avoiding truncated-BPTT issues.
+      - GlobalAveragePooling pools over the 22-step convolution output, giving
+        translation-invariant pattern detection across the 24h window.
+      - Scalar stream encodes physical state and safety bounds via a small MLP;
+        no temporal structure is needed here.
+      - Joint trunk (256 × 2) fuses both embeddings before computing action.
+
+    Safety projection is the caller's responsibility (Convention B).
     """
+
+    # State index constants (must match BESSEnvironment._get_obs layout)
+    _LMP_START  = 1    # obs[1..25]: current LMP + 24h history  (25 values)
+    _LMP_END    = 26
+    _SCALAR_IDX = [0] + list(range(26, 36))   # SoC + PV + step + segs4 + p_lo/hi + DoW + load
 
     def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int = 256):
         super().__init__()
-        # Shared trunk
-        self.fc1 = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.fc2 = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        # Output heads
+
+        # --- LMP temporal stream ---
+        self.lmp_conv   = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
+                                                  padding="causal", activation="relu")
+        self.lmp_pool   = tf.keras.layers.GlobalAveragePooling1D()
+        self.lmp_dense  = tf.keras.layers.Dense(32, activation="relu")
+
+        # --- Scalar physical stream ---
+        self.scalar_dense = tf.keras.layers.Dense(32, activation="relu")
+
+        # --- Joint trunk ---
+        self.trunk1 = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.trunk2 = tf.keras.layers.Dense(hidden_dim, activation="relu")
+
+        # --- Output heads ---
         self.mu_layer      = tf.keras.layers.Dense(act_dim)
         self.log_std_layer = tf.keras.layers.Dense(act_dim)
 
+    def _encode(self, obs: tf.Tensor) -> tf.Tensor:
+        """Encode obs into a joint embedding via dual-stream architecture."""
+        # LMP stream: shape (batch, 25) → (batch, 25, 1) for Conv1D
+        lmp   = tf.expand_dims(obs[:, self._LMP_START:self._LMP_END], axis=-1)
+        lmp_e = self.lmp_dense(self.lmp_pool(self.lmp_conv(lmp)))   # (batch, 32)
+
+        # Scalar stream
+        scalar_idx = tf.constant(self._SCALAR_IDX, dtype=tf.int32)
+        scalar     = tf.gather(obs, scalar_idx, axis=1)              # (batch, 11)
+        scalar_e   = self.scalar_dense(scalar)                       # (batch, 32)
+
+        # Joint trunk
+        joint = tf.concat([lmp_e, scalar_e], axis=-1)                # (batch, 64)
+        return self.trunk2(self.trunk1(joint))                        # (batch, 256)
+
     def _distribution_params(self, obs: tf.Tensor):
         """Return Gaussian parameters for the latent normalized action."""
-        h = self.fc2(self.fc1(obs))
-        mu = self.mu_layer(h)
+        h = self._encode(obs)
+        mu      = self.mu_layer(h)
         log_std = tf.clip_by_value(self.log_std_layer(h), LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std
 
@@ -568,25 +617,55 @@ class TwinQCritic(tf.keras.Model):
     """
     Twin Q-networks in a single keras.Model (Q1 and Q2 share no weights).
 
-    Architecture for each Qi:
-        concat(obs, act) (32) -> Dense(256, relu) -> Dense(256, relu) -> Dense(1)
+    Architecture for each Qi uses the same dual-stream encoder as the actor,
+    with action appended to the scalar stream (not to raw obs) so the critic
+    sees the action in the same semantic space as the physical state variables:
+
+      LMP stream  obs[1:26]  → Conv1D(32) → GAP → Dense(32) → 32-dim
+      Scalar+act  [obs_scalars, act]  → Dense(32) → 32-dim
+      Concat (64) → Dense(256, relu) → Dense(256, relu) → Dense(1)
 
     Using min(Q1, Q2) for target value reduces overestimation bias (Fujimoto 2018).
     """
 
+    _LMP_START  = 1
+    _LMP_END    = 26
+    _SCALAR_IDX = [0] + list(range(26, 36))
+
     def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int = 256):
         super().__init__()
-       
 
-        # Q1 network
-        self.q1_fc1 = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.q1_fc2 = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.q1_out = tf.keras.layers.Dense(1)
+        # Q1 dual-stream encoder
+        self.q1_lmp_conv   = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
+                                                     padding="causal", activation="relu")
+        self.q1_lmp_pool   = tf.keras.layers.GlobalAveragePooling1D()
+        self.q1_lmp_dense  = tf.keras.layers.Dense(32, activation="relu")
+        self.q1_scalar     = tf.keras.layers.Dense(32, activation="relu")
+        self.q1_fc1        = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.q1_fc2        = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.q1_out        = tf.keras.layers.Dense(1)
 
-        # Q2 network
-        self.q2_fc1 = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.q2_fc2 = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.q2_out = tf.keras.layers.Dense(1)
+        # Q2 dual-stream encoder (identical architecture, separate weights)
+        self.q2_lmp_conv   = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
+                                                     padding="causal", activation="relu")
+        self.q2_lmp_pool   = tf.keras.layers.GlobalAveragePooling1D()
+        self.q2_lmp_dense  = tf.keras.layers.Dense(32, activation="relu")
+        self.q2_scalar     = tf.keras.layers.Dense(32, activation="relu")
+        self.q2_fc1        = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.q2_fc2        = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.q2_out        = tf.keras.layers.Dense(1)
+
+    def _encode_one(self, obs, act, lmp_conv, lmp_pool, lmp_dense, scalar_dense, fc1, fc2, out):
+        """Shared encoding logic for one Q-network."""
+        lmp    = tf.expand_dims(obs[:, self._LMP_START:self._LMP_END], axis=-1)
+        lmp_e  = lmp_dense(lmp_pool(lmp_conv(lmp)))
+
+        scalar_idx = tf.constant(self._SCALAR_IDX, dtype=tf.int32)
+        scalar     = tf.gather(obs, scalar_idx, axis=1)
+        scalar_e   = scalar_dense(tf.concat([scalar, act], axis=-1))   # action in scalar stream
+
+        joint = tf.concat([lmp_e, scalar_e], axis=-1)
+        return out(fc2(fc1(joint)))
 
     def call(self, inputs):
         """
@@ -601,10 +680,12 @@ class TwinQCritic(tf.keras.Model):
         q1, q2 : tf.Tensor, shape (batch, 1) each
         """
         obs, act = inputs
-        sa = tf.concat([obs, act], axis=-1)
-
-        q1 = self.q1_out(self.q1_fc2(self.q1_fc1(sa)))
-        q2 = self.q2_out(self.q2_fc2(self.q2_fc1(sa)))
+        q1 = self._encode_one(obs, act,
+                               self.q1_lmp_conv, self.q1_lmp_pool, self.q1_lmp_dense,
+                               self.q1_scalar, self.q1_fc1, self.q1_fc2, self.q1_out)
+        q2 = self._encode_one(obs, act,
+                               self.q2_lmp_conv, self.q2_lmp_pool, self.q2_lmp_dense,
+                               self.q2_scalar, self.q2_fc1, self.q2_fc2, self.q2_out)
         return q1, q2
 
 
@@ -919,15 +1000,18 @@ class SACAgent:
          bounds, next_bounds,
          sample_indices, is_weights) = buffer.sample(self.batch_size)
 
-        # Convert to TF tensors once
-        obs_tf          = tf.constant(obs,         dtype=tf.float32)
-        act_tf          = tf.constant(act,         dtype=tf.float32)
-        rew_tf          = tf.constant(rew,         dtype=tf.float32)
-        next_obs_tf     = tf.constant(next_obs,    dtype=tf.float32)
-        done_tf         = tf.constant(done,        dtype=tf.float32)
-        bounds_tf       = tf.constant(bounds,      dtype=tf.float32)  # (batch, 2) at s_t
-        next_bounds_tf  = tf.constant(next_bounds, dtype=tf.float32)  # (batch, 2) at s_{t+N}
-        is_weights_tf   = tf.constant(is_weights,  dtype=tf.float32)  # (batch, 1)
+        # Pass numpy arrays directly — @tf.function on the inner methods handles
+        # conversion without creating persistent constant graph nodes.
+        # tf.constant() inside a Python loop accumulates graph nodes on Metal backend,
+        # causing episode time to grow 4× over 1000 episodes → OOM kill.
+        obs_tf          = obs.astype(np.float32)
+        act_tf          = act.astype(np.float32)
+        rew_tf          = rew.astype(np.float32)
+        next_obs_tf     = next_obs.astype(np.float32)
+        done_tf         = done.astype(np.float32)
+        bounds_tf       = bounds.astype(np.float32)       # (batch, 2) at s_t
+        next_bounds_tf  = next_bounds.astype(np.float32)  # (batch, 2) at s_{t+N}
+        is_weights_tf   = is_weights.astype(np.float32)   # (batch, 1)
 
         # IS-weighted critic update; returns per-sample |δ_i| for PER
         critic_loss, td_errors = self._update_critic(
