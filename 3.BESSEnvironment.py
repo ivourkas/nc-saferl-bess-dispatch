@@ -488,7 +488,7 @@ class BESSEnv(gym.Env):
 
         Returns
         -------
-        obs : np.ndarray, shape (34,)
+        obs : np.ndarray, shape (36,)
         info : dict with episode start info
         """
         super().reset(seed=seed)
@@ -533,7 +533,7 @@ class BESSEnv(gym.Env):
 
         Returns
         -------
-        obs       : np.ndarray (34,)
+        obs       : np.ndarray (36,)
         reward    : float      [scaled $]
         terminated: bool       (episode done, always at step 168)
         truncated : bool       (always False -- no timeout)
@@ -747,7 +747,7 @@ class BESSEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         """
-        Build the 34-dimensional state vector at the current timestep.
+        Build the 36-dimensional state vector at the current timestep.
 
         Layout:
           [0]       SoC / E_cap                     (normalized, 0..1)
@@ -940,7 +940,7 @@ def validate_env(n_episodes: int = 5, verbose: bool = True) -> Dict[str, Any]:
         print(f"  {k:6s}: ${v:.2f}/MWh")
 
     # Check spaces (obs dim = 34: 1+1+24+1+1+4+2, step_in_ep and p_lo/p_hi added)
-    assert env.observation_space.shape == (34,), "Wrong obs shape"
+    assert env.observation_space.shape == (36,), "Wrong obs shape"
     assert env.action_space.shape == (1,), "Wrong action shape"
     print(f"\nSpaces OK: obs={env.observation_space.shape}, action={env.action_space.shape}")
 

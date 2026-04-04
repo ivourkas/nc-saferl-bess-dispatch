@@ -20,7 +20,7 @@ violation, yet the RL training operates on the *projected* feasible action.
 ARCHITECTURE
 ------------
   ReplayBuffer          Circular numpy buffer (200 k transitions, ~25 MB RAM)
-  SquashedGaussianActor MLP 34 -> [256, 256] -> (mu, log_std), tanh squash
+  SquashedGaussianActor MLP 36 -> [256, 256] -> (mu, log_std), tanh squash
   TwinQCritic           Two Q-networks in one model, min(Q1, Q2) for targets
   SACAgent              Wires all pieces; @tf.function for all gradient steps
   PerfectForesightLP    scipy linprog oracle (no network constraints) for benchmark
@@ -243,9 +243,9 @@ class ReplayBuffer:
     Circular numpy replay buffer for off-policy experience with Prioritized
     Experience Replay (PER).
 
-    Memory layout (200 k transitions, obs_dim=34, act_dim=1):
-      obs        : (200k, 34) float32  ~27.2 MB
-      next_obs   : (200k, 34) float32  ~27.2 MB
+    Memory layout (200 k transitions, obs_dim=36, act_dim=1):
+      obs        : (200k, 36) float32  ~28.8 MB
+      next_obs   : (200k, 36) float32  ~28.8 MB
       act        : (200k,  1) float32   ~0.8 MB   <- projected action (a_safe)
       rew        : (200k,  1) float32   ~0.8 MB
       done       : (200k,  1) float32   ~0.8 MB
@@ -623,7 +623,7 @@ class SACAgent:
 
     Parameters
     ----------
-    obs_dim : int   -- observation space dimensionality (34)
+    obs_dim : int   -- observation space dimensionality (36)
     act_dim : int   -- action space dimensionality (1)
     hp      : dict  -- hyperparameter dict (see HP at top of file)
     """
