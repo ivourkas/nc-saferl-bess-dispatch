@@ -1,54 +1,8 @@
 """
-Step 2: Pre-compute LMPs, Line Flows, and PTDF for all 8,784 Hours
-====================================================================
-Author: Yiannis Vourkas
+Step 2: pre-compute hourly LMPs, baseline line flows, and PTDF data.
 
-WHY THIS STEP EXISTS
---------------------
-The RL agent needs LMPs and line flows at every training step (millions of
-calls). Running a full DC-OPF inside the training loop would make training
-10-100x slower. Instead, we run all 8,784 OPFs ONCE here and store the
-results as fast numpy lookup arrays.
-
-During RL training, the environment just does:
-    lmp_now    = lmps[hour]          # 73 values, 0.0001 ms
-    flows_now  = line_flows[hour]    # 120 values, 0.0001 ms
-instead of:
-    pp.rundcopp(net)                 # ~500-1000 ms
-
-WHAT THIS SCRIPT PRODUCES (in outputs/)
-----------------------------------------
-  step2_lmps.npy          (8784, 73)  LMP at each bus each hour [$/MWh]
-  step2_line_flows.npy    (8784, 120) Baseline MW flow on each AC branch
-  step2_ptdf.npy          (120,  73)  PTDF matrix (constant, topology-only)
-  step2_converged.npy     (8784,)     Bool: did the OPF converge this hour?
-  step2_line_limits.npy   (120,)      Thermal limit per branch [MW], in
-                                      pandapower [lines, trafos] order.
-                                      Matches the constraint the OPF enforces.
-                                      Used by Step 3 safety-layer QP.
-  step2_pv_total.npy      (8784,)     System-wide PV+RTPV generation [MW].
-                                      Used as a state feature in Step 3.
-  step2_metadata.json                 Shapes, bus order, branch names
-
-  DROPPED (no longer saved):
-  step2_line_loadings.npy -- Redundant: derivable as line_flows / line_limits * 100.
-                             Not loaded by Step 3 (safety layer uses flows + limits directly).
-  step2_pv_bus313.npy     -- Not used anywhere; saved for reference only. Eliminated.
-
-THE PTDF MATRIX
----------------
-PTDF[l, k] = change in flow on branch l (MW) for 1 MW injection at bus k,
-             with the slack bus (bus 113) as the reference withdrawal point.
-
-Used in the safety layer QP (Step 4):
-    F_l,t = F_l,t_base + PTDF[l, battery_bus] * P_battery
-    |F_l,t| <= F_l_max   for all lines l
-
-PTDF is constant for a fixed topology. We compute it ONCE numerically:
-for each non-slack bus k:
-    1. Add +1 MW injection at bus k (via -1 MW temporary load)
-    2. Run DC power flow (slack absorbs the +1 MW withdrawal automatically)
-    3. PTDF[:, k] = new_flows - base_flows   (sensitivity per unit injection)
+The main output of this step is a set of numpy arrays used directly by the
+environment so RL does not need to solve DC-OPFs online.
 """
 
 import pandas as pd
@@ -68,6 +22,17 @@ RTS_SRC          = os.path.join(os.path.dirname(__file__),
 RTS_TS           = os.path.join(os.path.dirname(__file__),
                                 "RTS-GMLC", "RTS_Data", "timeseries_data_files")
 CHECKPOINT_EVERY = 500    # Save partial arrays every N hours (crash recovery)
+RELAXED_OPF_KW   = {
+    # Last-chance numerical rescue before imputation.
+    # This does not change the modeled network or costs; it only relaxes the
+    # interior-point convergence tolerances and iteration cap.
+    "check_connectivity": False,
+    "PDIPM_MAX_IT": 300,
+    "OPF_VIOLATION": 1e-4,
+    "PDIPM_GRADTOL": 1e-4,
+    "PDIPM_COMPTOL": 1e-4,
+    "PDIPM_COSTTOL": 1e-4,
+}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -117,18 +82,7 @@ print("=" * 70)
 
 def compute_ptdf_numerical(net):
     """
-    Compute PTDF by perturbing each non-slack bus one at a time.
-
-    For each bus k:
-      1. Add a temporary -1 MW load at bus k  (+1 MW net injection)
-      2. Run DC power flow  (slack gen absorbs the extra MW automatically,
-         so the net effect is: +1 MW at bus k, -1 MW at slack bus)
-      3. PTDF[:, k] = (flows_with_injection) - (base_flows)
-
-    This is the standard "shift factor" method. It gives PTDF in the
-    exact pandapower line/trafo ordering, no internal API needed.
-
-    Returns: ndarray of shape (N_BR, N_BUS) = (120, 73)
+    Compute PTDF columns by injecting 1 MW at each non-slack bus in turn.
     """
     slack_pp_idx = int(net.ext_grid["bus"].values[0])   # pandapower bus index of slack
 
@@ -218,37 +172,29 @@ base_load_by_bus = {
 # HELPER FUNCTIONS  (same physics as Step 1, factored out cleanly)
 # ════════════════════════════════════════════════════════════════
 
-def apply_loads_for_hour(hour):
+def apply_loads_for_hour(hour, working_net=None):
     """
-    Scale every bus load proportionally to the area's actual hourly MW.
-
-    Formula:  bus_load_h = base_bus_load × (area_total_h / area_base_total)
-
-    base_bus_load  = peak value from bus.csv  (constant)
-    area_total_h   = actual area MW from time-series for hour h
-    area_base_total = sum of base loads in that area (~2850 MW each)
+    Scale bus loads to the area's hourly total for the requested hour.
     """
+    global net
+    _net = working_net if working_net is not None else net
     for bus_id, (base_p, base_q) in base_load_by_bus.items():
         if base_p <= 0 and base_q <= 0:
             continue                              # no load at this bus
         area  = bus_area[bus_id]
         scale = float(load_ts.iloc[hour][str(area)]) / area_base_load[area]
-        mask  = net.load["name"] == f"Load_{bus_id}"
+        mask  = _net.load["name"] == f"Load_{bus_id}"
         if mask.any():
-            net.load.loc[mask, "p_mw"]   = base_p * scale
-            net.load.loc[mask, "q_mvar"] = base_q * scale
+            _net.load.loc[mask, "p_mw"]   = base_p * scale
+            _net.load.loc[mask, "q_mvar"] = base_q * scale
 
 
-def apply_renewables_for_hour(hour):
+def apply_renewables_for_hour(hour, working_net=None):
     """
-    Cap each renewable generator's max output to what the time-series says.
-
-    The OPF will dispatch renewables at their time-series value (zero cost →
-    always fully dispatched up to the cap). Thermal units fill the rest.
-
-    We also guard against max_p_mw < min_p_mw which would make the OPF
-    infeasible (e.g. a hydro plant with PMin=5 MW but time-series gives 0).
+    Update renewable output limits from the hourly time-series data.
     """
+    global net
+    _net = working_net if working_net is not None else net
     for ts_df, keyword in [
         (wind_ts,  "WIND"),
         (pv_ts,    "PV"),
@@ -264,13 +210,23 @@ def apply_renewables_for_hour(hour):
 
             if kind == "ext":
                 # Slack ext_grid acting as a renewable: cap its max output
-                net.ext_grid.at[idx, "max_p_mw"] = max(val, 0.1)
+                _net.ext_grid.at[idx, "max_p_mw"] = max(val, 0.1)
             else:
-                pmin = float(net.gen.at[idx, "min_p_mw"])
+                pmin = float(_net.gen.at[idx, "min_p_mw"])
                 # Ensure max ≥ min (otherwise OPF is infeasible for this unit)
-                net.gen.at[idx, "max_p_mw"] = max(val, pmin)
+                _net.gen.at[idx, "max_p_mw"] = max(val, pmin)
                 # Keep starting dispatch ≤ new max  (feasibility of warm-start)
-                net.gen.at[idx, "p_mw"]     = min(net.gen.at[idx, "p_mw"], val)
+                _net.gen.at[idx, "p_mw"]     = min(_net.gen.at[idx, "p_mw"], val)
+
+
+def build_fresh_hour_net(hour):
+    """
+    Reload the clean Step 1 network and apply the requested hour's exogenous data.
+    """
+    fresh_net = pp.from_json(os.path.join(OUT_DIR, "step1_network.json"))
+    apply_loads_for_hour(hour, working_net=fresh_net)
+    apply_renewables_for_hour(hour, working_net=fresh_net)
+    return fresh_net
 
 
 # ════════════════════════════════════════════════════════════════
@@ -285,12 +241,11 @@ est_hi = N_HOURS * 1.5 / 3600
 print(f"  Estimated time: {est_lo:.1f} – {est_hi:.1f} hours (hardware dependent)\n")
 
 # ── Pre-allocate result arrays (NaN = not yet filled / failed) ────────────
-# lmps[h, k]          = LMP at pandapower bus index k at hour h  [$/MWh]
-# line_flows[h, l]    = MW flow on branch l at hour h            [MW]
-#                       columns 0..N_LINE-1   → AC lines  (net.res_line)
-#                       columns N_LINE..N_BR-1 → trafos   (net.res_trafo)
-# line_loadings[h, l] = loading % on branch l at hour h          [%]
-# converged[h]        = True if the OPF solved successfully
+# lmps[h, k]       = LMP at pandapower bus index k at hour h  [$/MWh]
+# line_flows[h, l]  = MW flow on branch l at hour h            [MW]
+#                     columns 0..N_LINE-1    → AC lines  (net.res_line)
+#                     columns N_LINE..N_BR-1 → trafos   (net.res_trafo)
+# converged[h]      = True if the OPF solved successfully
 lmps          = np.full((N_HOURS, N_BUS), np.nan, dtype=np.float32)
 line_flows    = np.full((N_HOURS, N_BR),  np.nan, dtype=np.float32)
 converged     = np.zeros(N_HOURS, dtype=bool)
@@ -305,6 +260,8 @@ prev_flows = np.zeros(N_BR, dtype=np.float32)
 
 t_start  = time.time()
 n_failed = 0
+n_recovered_fresh   = 0
+n_recovered_relaxed = 0
 
 for hour in range(N_HOURS):
 
@@ -318,27 +275,66 @@ for hour in range(N_HOURS):
     #   - line thermal limits (set at 75% in Step 1 via max_i_ka)
     #   - DC power flow equations (Kirchhoff's laws)
     # The shadow prices on the nodal balance constraints = LMPs (lam_p)
+    #
+    # Retry logic:
+    # 1) try the rolling sequential net,
+    # 2) if that fails, reload a fresh copy of the Step 1 network and retry,
+    # 3) if that still fails, try one last fresh-net solve with mildly relaxed
+    #    interior-point tolerances before falling back to imputation.
+    #
+    # This keeps the physical model unchanged while giving the OPF solver a more
+    # robust numerical path on the handful of hard hours.
+    def _try_solve(working_net, **opf_kwargs):
+        """Run rundcopp on working_net and return extracted results, or raise."""
+        pp.rundcopp(working_net, verbose=False, **opf_kwargs)
+        lmp_h   = working_net.res_bus["lam_p"].values.astype(np.float32)
+        flow_h  = np.empty(N_BR, dtype=np.float32)
+        flow_h[:N_LINE] = working_net.res_line["p_from_mw"].values
+        flow_h[N_LINE:] = working_net.res_trafo["p_hv_mw"].values
+        return lmp_h, flow_h
+
+    _solved = False
+    _solve_mode = "sequential"
     try:
-        pp.rundcopp(net, verbose=False)
+        _lmp_h, _flow_h = _try_solve(net)
+        _solved = True
+    except Exception:
+        # First failure: may be sequential-state path dependence.
+        # Retry on a clean copy of the network with the same hour's exogenous data.
+        _net_fresh = build_fresh_hour_net(hour)
+        try:
+            _lmp_h, _flow_h = _try_solve(_net_fresh)
+            net = _net_fresh   # promote fresh net: subsequent hours use clean state
+            _solve_mode = "fresh"
+            _solved = True
+        except Exception:
+            # Last-chance rescue: same physical hour, but with more permissive
+            # numerical tolerances for the interior-point OPF solver.
+            _net_relaxed = build_fresh_hour_net(hour)
+            try:
+                _lmp_h, _flow_h = _try_solve(_net_relaxed, **RELAXED_OPF_KW)
+                net = _net_relaxed
+                _solve_mode = "relaxed"
+                _solved = True
+            except Exception:
+                pass   # genuine failed hour after all rescue attempts
 
+    if _solved:
         # ── D3: Extract results ────────────────────────────────────────────
-        # LMPs at all buses  (shape: N_BUS)
-        lmps[hour] = net.res_bus["lam_p"].values.astype(np.float32)
-
-        # Branch flows: AC lines first, then transformers
-        # p_from_mw = MW injected at the "from" bus end of the branch
-        line_flows[hour, :N_LINE]    = net.res_line["p_from_mw"].values
-        line_flows[hour, N_LINE:]    = net.res_trafo["p_hv_mw"].values
-
-        converged[hour] = True
-        prev_lmps = lmps[hour].copy()
-        prev_flows = line_flows[hour].copy()
-
-    except Exception as e:
-        # ── D4: Failed OPF ─────────────────────────────────────────────────
-        # Mark as failed; use previous hour's LMPs as a fallback.
-        # Failed hours are flagged in converged[] so Step 3 can skip them or
-        # handle them specially during RL episode construction.
+        lmps[hour]       = _lmp_h
+        line_flows[hour] = _flow_h
+        converged[hour]  = True
+        prev_lmps  = _lmp_h.copy()
+        prev_flows = _flow_h.copy()
+        if _solve_mode == "fresh":
+            n_recovered_fresh += 1
+        elif _solve_mode == "relaxed":
+            n_recovered_relaxed += 1
+    else:
+        # ── D4: Genuine failed OPF ─────────────────────────────────────────
+        # Only reached after sequential solve, fresh exact retry, and relaxed
+        # fresh retry all fail.  Carry forward the previous converged snapshot
+        # as a best-effort fallback.
         lmps[hour]       = prev_lmps
         line_flows[hour] = prev_flows
         converged[hour]  = False
@@ -353,6 +349,8 @@ for hour in range(N_HOURS):
         lmp_mean  = float(lmps[hour].mean()) if converged[hour] else float("nan")
         print(f"  [{pct:5.1f}%] h={hour+1:4d}/{N_HOURS} | "
               f"failed={n_failed:3d} | "
+              f"rescued={n_recovered_fresh + n_recovered_relaxed:3d} "
+              f"(fresh={n_recovered_fresh:3d}, relaxed={n_recovered_relaxed:3d}) | "
               f"elapsed={elapsed/60:5.1f}m | "
               f"ETA={eta_s/60:5.1f}m | "
               f"LMP_mean=${lmp_mean:.2f}")
@@ -424,6 +422,8 @@ metadata = {
     # Quality
     "n_converged":       int(converged.sum()),
     "n_failed":          int(n_failed),
+    "n_recovered_fresh": int(n_recovered_fresh),
+    "n_recovered_relaxed": int(n_recovered_relaxed),
     "convergence_rate":  float(converged.mean()),
     # Axis labels
     # lmps[:, k]          → LMP at RTS bus ID bus_order[k]

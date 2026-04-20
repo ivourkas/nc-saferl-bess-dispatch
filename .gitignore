@@ -7,26 +7,30 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ipynb_checkpoints/
-*.egg-info/
 
 # OS/editor files
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
 
-# Training artifacts and generated outputs
-outputs/
-*.npy
-*.h5
+# Local interpreter pin
+.python-version
+
+# External dataset / local research material
+RTS-GMLC/
+Literature/
+archive/
+
+# Generated outputs: keep only final exported agent
+outputs/*
+!outputs/step4_final/
+!outputs/step4_final/**
+
+# Other generated files
 *.ckpt
 *.log
 
-# External dataset (kept in its own source repository)
-RTS-GMLC/
-
-# Internal documentation assets
-*.pdf
-*.ppt
-*.pptx
-*.md
-!/README.md
+# Local/internal notes
+STEP4_SAC_DEEP_DIVE.md
 make_pptx.py

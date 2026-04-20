@@ -1,54 +1,8 @@
 """
-Step 4: SAC Agent with Expert Warm-Start for NC-SafeRL BESS Dispatch
-=====================================================================
-Author: Yiannis Vourkas
+Step 4: Soft Actor-Critic agent for the NC-SafeRL BESS environment.
 
-Implements Soft Actor-Critic (SAC-v2, Haarnoja et al. 2019,
-arXiv:1812.05905v2) for the BESS economic dispatch environment built
-in Step 3.
-
-NC-SafeRL NOVELTY
------------------
-This is the only BESS RL paper that embeds a PTDF-based network safety layer
-inside the Gymnasium environment (Step 3). The safety layer performs an exact
-1-D QP projection at every step, enforcing:
-  (a) SoC feasibility bounds
-  (b) DC line-flow limits via PTDF sensitivity for all 120 branches
-Safety is guaranteed by construction -- the agent never sees a constraint
-violation, yet the RL training operates on the *projected* feasible action.
-
-ARCHITECTURE
-------------
-  ReplayBuffer          Circular numpy buffer (200 k transitions, ~25 MB RAM)
-  SquashedGaussianActor MLP 36 -> [256, 256] -> (mu, log_std), tanh squash
-  TwinQCritic           Two Q-networks in one model, min(Q1, Q2) for targets
-  SACAgent              Wires all pieces; @tf.function for all gradient steps
-  PerfectForesightLP    scipy linprog oracle (no network constraints) for benchmark
-
-TRAINING PROTOCOL
------------------
-  SAC training  : up to 5 000 episodes × 168 gradient updates/episode
-  Eval          : every 100 episodes on ALL ~95 test starts (deterministic)
-  Checkpoint    : every 100 episodes → outputs/step4_checkpoints/
-  Early stop    : patience=12 evals, min_delta=0.001
-
-HYPERPARAMETERS (HP dict)
--------------------------
-  gamma = 0.99   tau = 0.005   lr = 3e-4   alpha_lr = 1e-4
-  batch_size = 256   buffer_size = 200 000   n_step = 8
-  target_entropy_scale = -0.75   init_alpha = 0.03   alpha_min = 0.0005
-  proj_lambda = 0.01   lp_warmstart_steps = 10 000   warmstart_bc_steps = 750
-
-OUTPUTS
--------
-  outputs/step4_training_log.npy      dict with training metrics
-  outputs/step4_checkpoints/ep<N>/    Keras weight files + log_alpha
-
-FRAMEWORK
----------
-  TensorFlow 2.16.2 + tensorflow-metal 1.2.0 (Apple Silicon GPU via Metal API).
-  Falls back to CPU automatically if Metal plugin is not installed.
-  3.BESSEnvironment imported via importlib (filename starts with digit).
+This file contains the replay buffer, actor/critic models, LP warm-start,
+training loop, evaluation utilities, and checkpoint/log handling.
 """
 
 # ================================================================
@@ -59,20 +13,28 @@ import os
 import sys
 import math
 import time
+import datetime
 import importlib.util
 from collections import deque   # used by run_episode_collect for N-step window
 import numpy as np
 
-# -- TensorFlow (Apple Silicon / Metal GPU) --
+# -- TensorFlow device selection --
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"          # suppress TF INFO logs
 import tensorflow as tf
 
-# Verify Metal GPU is available; fall back to CPU gracefully
-_gpus = tf.config.list_physical_devices("GPU")
-if _gpus:
-    print(f"[TF] Metal GPU detected: {[g.name for g in _gpus]}")
+# Force CPU execution for reproducibility while debugging the Metal path.
+FORCE_CPU = True
+if FORCE_CPU:
+    try:
+        tf.config.set_visible_devices([], "GPU")
+    except Exception:
+        pass
+
+_visible_gpus = tf.config.get_visible_devices("GPU")
+if _visible_gpus:
+    print(f"[TF] Metal GPU detected: {[g.name for g in _visible_gpus]}")
 else:
-    print("[TF] No GPU found — running on CPU")
+    print("[TF] CPU-only mode enabled")
 
 from scipy.optimize import linprog
 
@@ -98,82 +60,38 @@ OUTPUTS_DIR = os.path.join(_HERE, "outputs")
 HP = {
     # SAC
     "gamma":          0.99,       # discount factor
-    "tau":            0.005,      # target network soft-update rate
-    "lr":             3e-4,       # learning rate (actor, critic)
-    "alpha_lr":       1e-4,       # slower alpha updates: avoids early collapse
+    "tau":            0.005,      # target-network soft-update rate
+    "lr":             1e-4,       # actor/critic learning rate
+    "alpha_lr":       1e-5,       # entropy learning rate
     "hidden_dim":     256,        # hidden layer width
-    "hidden_layers":  2,          # number of hidden layers    
-    "target_entropy_scale": -8.0,    # Calibrated to actual achievable entropy.
-                                     # After BC warmstart saturates tanh at ±1, log_pi ≈ +4 to +8.
-                                     # Target must be BELOW achievable entropy so alpha decays.
-                                     # With PTDF constraints binding 86% of hours (bang-bang policy),
-                                     # steady-state policy entropy ≈ -5 to -10.
-                                     # -8.0 allows alpha to decay from init while preserving
-                                     # enough entropy incentive to prevent premature convergence.
+    "hidden_layers":  2,
+    "target_entropy_scale": -1, # lower entropy target for constrained 1D actions
     # Buffer & batch
-    "buffer_size":    200_000,    
+    "buffer_size":    500_000,    # replay capacity
     "batch_size":     256,
-    # Minimum buffer fill before ANY gradient update begins.
-    # Starting at batch_size=256 (≈1 episode) caused the critic to overfit
-    # catastrophically to near-identical early transitions.
-    # 2000 transitions ≈ 12 random episodes,
-    # providing enough diversity for stable initial TD targets.
-    "min_buffer_fill": 2_000,
-    # LP Expert Warm-Start (fills buffer before SAC training begins).
-    # 10 000 transitions = 5% of total buffer capacity (200 k).
-    
-    "lp_warmstart_steps": 10_000,
-    # Optional actor behavior-cloning pretrain on LP warm-start transitions.
-    # Warm-start transitions directly supervise the policy before on-policy SAC
-    # updates begin, making the expert data useful for BOTH critic and actor.
-    "warmstart_bc_steps": 750,
-    "warmstart_bc_batch_size": 256,
-    
-    # Anticipatory projection penalty: pushes the actor toward naturally feasible
-    # outputs so the Q-gradient (zero when clipped) is supplemented by a direct
-    # feasibility gradient at the ~86% of steps where PTDF constraints bind.
-    "proj_lambda":    0.01,       # non-zero restores gradient under tight PTDF constraints
-    # N-step return horizon.
-    # Buffer stores G_t^N = sum_{k=0}^{N-1} gamma^k * r_{t+k}; critic
-    # bootstraps with gamma^N. N=8 spans one-third of a daily price cycle,
-    # directly bridging the credit-assignment gap between charging (negative
-    # immediate reward) and profitable discharge 4-12 h later.
-    "n_step":         8,
-    # Initial entropy coefficient alpha.
-    # SAC default log_alpha=0.0 → alpha=1.0. With REWARD_SCALE=1e-3 our
-    # per-step rewards are O(0.001), so alpha=1.0 overwhelms the Q-signal
-    # by ~500× in early training, forcing pure-entropy optimisation for
-    # 100+ episodes before alpha decays. alpha=0.01 starts the entropy
-    # term at the same order of magnitude as per-step rewards from ep 1.
-    # Slightly higher start value to preserve exploration while the critic is
-    # still forming its first profitable arbitrage estimates.
-    "init_alpha":     0.03,
-    # Hard lower bound on alpha (prevents critic divergence from alpha → 0).
-    # Without this, auto-alpha can drive log_alpha → -∞ when the policy
-    # over-concentrates (e.g. after policy collapses onto a local optimum).
-   
-    "alpha_min":      0.0005,
-    # Hard upper bound on alpha (prevents runaway when log_pi > -target_entropy,
-    # which occurs after BC warmstart pushes policy to saturate tanh at ±1).
-    "alpha_max":      0.05,   # was 1.0: with reward_scale=0.001, alpha=1.0 is 20× too large.
-                              # Per-step rewards O(0.001); alpha × log_pi must stay same order.
-                              # 0.05 × log_pi(~5) = 0.25 >> per-step reward O(0.001-0.1) ✓
-    # Training schedule
-    "train_episodes": 5_000,      # SAC episodes (upper bound; early stopping
-                                  # will halt before this if policy converges)
-    "eval_freq":      100,       
-    
+    "min_buffer_fill": 12_000,    # dilute LP warm-start before online SAC updates
+    "lp_warmstart_steps": 5_000,  # PTDF-feasible LP transitions
+    "lp_bc_steps":        1000,
+    "lp_bc_active_threshold": 0.02,
+    "lp_bc_active_frac":      0.85,
 
-    "early_stop_patience":  12,   
-    
-    "early_stop_min_delta": 0.001,# min improvement to reset patience 
-    # Reproducibility
+    "proj_lambda":    0.0,        # projection penalty disabled
+    "n_step":         1,          # standard TD(0)
+    "init_alpha":     0.003,      # initial entropy coefficient
+    "alpha_min":      1e-5,       # lower alpha bound
+    "alpha_max":      0.10,       # upper alpha bound
+    "train_episodes": 5_000,      # maximum episodes; early stopping may stop earlier
+    "eval_freq":      100,        # evaluate and checkpoint every N episodes
+    "early_stop_patience":  12,
+    "early_stop_min_delta": 0.001,
+    "per_alpha":      0.0,        # uniform replay
     "seed":           42,
 }
 
-# Actor log-std clipping
-LOG_STD_MIN = -20.0
-LOG_STD_MAX =  2.0
+# Actor log-std clipping.
+# These bounds keep exploration finite and the squashed-Gaussian numerically stable.
+LOG_STD_MIN = -5.0
+LOG_STD_MAX =  1.0
 
 
 # ================================================================
@@ -182,25 +100,7 @@ LOG_STD_MAX =  2.0
 
 class SumTree:
     """
-    Binary sum-tree for O(log N) priority-based sampling.
-
-    Internal layout
-    ---------------
-    The tree has 2*capacity nodes stored in a flat array.  Leaves occupy
-    indices [capacity, 2*capacity).  Internal node k stores the sum of its
-    two children: tree[k] = tree[2k] + tree[2k+1].  The root tree[1] holds
-    the total priority sum used to draw stratified samples.
-
-    Operations
-    ----------
-    update(idx, p)   O(log N) — set leaf idx = p and propagate sums upward.
-    retrieve(value)  O(log N) — return leaf whose cumulative sum spans value.
-    total            O(1)     — root value = sum of all priorities.
-
-    Reference
-    ---------
-    Schaul et al. (2016) "Prioritized Experience Replay," ICLR 2016,
-    arXiv:1511.05952, §3.3 (sum-tree implementation).
+    Flat binary tree for O(log N) PER sampling and updates.
     """
 
     def __init__(self, capacity: int):
@@ -218,12 +118,7 @@ class SumTree:
             pos >>= 1
 
     def retrieve(self, value: float) -> int:
-        """
-        Walk the tree top-down to find the leaf whose prefix sum spans value.
-
-        Returns the data index in [0, capacity).
-        value must satisfy 0 <= value < self.total.
-        """
+        """Return the data index whose prefix sum spans the sampled value."""
         pos = 1
         while pos < self.capacity:
             left = 2 * pos
@@ -245,59 +140,10 @@ class SumTree:
 
 class ReplayBuffer:
     """
-    Circular numpy replay buffer for off-policy experience with Prioritized
-    Experience Replay (PER).
+    Circular replay buffer with optional PER.
 
-    Memory layout (200 k transitions, obs_dim=36, act_dim=1):
-      obs        : (200k, 36) float32  ~28.8 MB
-      next_obs   : (200k, 36) float32  ~28.8 MB
-      act        : (200k,  1) float32   ~0.8 MB   <- projected action (a_safe)
-      rew        : (200k,  1) float32   ~0.8 MB
-      done       : (200k,  1) float32   ~0.8 MB
-      bounds     : (200k,  2) float32   ~1.6 MB   <- [p_lo, p_hi] at s_t
-      next_bounds: (200k,  2) float32   ~1.6 MB   <- [p_lo, p_hi] at s_{t+N}
-      SumTree    : (400k,)   float64   ~3.2 MB
-    Total: ~63 MB
-
-    bounds / next_bounds semantics (Convention B)
-    ---------------------------------------------
-    bounds stores the safety-layer feasibility interval [p_lo, p_hi]
-    (normalised to [-1,1]) for the CURRENT state s_t.  The actor update
-    projects a_raw → a_proj before Q-evaluation.
-
-    next_bounds stores the same interval for the NEXT (bootstrap) state s_{t+N}.
-    Used in the critic target to project the sampled next action, ensuring
-    Convention B consistency:
-      Q̂(s_t,a_t) = G_t^N + γ^N*(1-done)*[min_Q(s_{t+N}, clip(a',next_bounds))
-                                            - α*log_π(a'|s_{t+N})]
-    Without this, the critic target would be evaluated at a raw (infeasible)
-    action ~83% of the time, causing off-distribution Q-overestimation.
-
-    Prioritized Experience Replay (PER)
-    ------------------------------------
-    New transitions are assigned max_priority (initially 1.0), ensuring they
-    are sampled at least once before being deprioritised.  After each gradient
-    step, the caller supplies per-sample TD errors; priorities are updated as:
-
-        p_i = (|δ_i| + ε)^α_per
-
-    Sampling probability: P(i) = p_i / Σ_j p_j   (via SumTree)
-
-    Importance-sampling correction weight (bias correction for non-uniform
-    sampling; see Schaul et al. 2016 eq 1–2):
-
-        w_i = (1/N · 1/P(i))^β,   normalised by max_j(w_j)
-
-    β is annealed from β_init=0.4 → 1.0 over training, removing IS bias
-    asymptotically (full correction at convergence).
-
-    Hyper-parameters (Schaul et al. 2016, Table 1):
-      per_alpha    = 0.6   prioritisation strength (0 = uniform)
-      per_beta_init= 0.4   IS correction exponent start value
-      per_eps      = 1e-6  priority floor (prevents zero sampling probability)
-
-    Reference: Schaul et al. (2016) "Prioritized Experience Replay,"
-    ICLR 2016, arXiv:1511.05952.
+    Stores observations, actions, rewards, dones, and current/next feasibility
+    bounds used by the safety-aware critic target.
     """
 
     def __init__(
@@ -342,13 +188,7 @@ class ReplayBuffer:
         next_p_lo_norm: float = -1.0,
         next_p_hi_norm: float =  1.0,
     ) -> None:
-        """Store one transition.
-
-        p_lo_norm / p_hi_norm      : safety bounds at s_t (current state).
-        next_p_lo_norm / next_p_hi_norm : safety bounds at s_{t+N} (bootstrap
-            state).  Used in the critic target to project the sampled next
-            action before querying the target Q-network (Convention B).
-        All bounds normalised to [-1, 1] via p_mw / P_MAX."""
+        """Store one transition and its current/next normalized safety bounds."""
         idx = self.ptr                  # data index BEFORE advance (for SumTree)
         self.obs[idx]              = obs
         self.act[idx]              = act
@@ -359,17 +199,13 @@ class ReplayBuffer:
         self.bounds[idx, 1]        = float(p_hi_norm)
         self.next_bounds[idx, 0]   = float(next_p_lo_norm)
         self.next_bounds[idx, 1]   = float(next_p_hi_norm)
-        # Assign max priority to new transition so it is sampled at least once
-        # before its TD error is known (Schaul et al. 2016 §3.3).
+        # Give new transitions the current max priority until they are updated.
         self._sum_tree.update(idx, self._max_priority)
         self.ptr  = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
     def add_episode(self, transitions: list) -> None:
-        """Bulk-add a list of transitions.  Accepted tuple lengths:
-        9: (obs, act, rew, next_obs, done, p_lo, p_hi, next_p_lo, next_p_hi)
-        7: (obs, act, rew, next_obs, done, p_lo, p_hi)
-        5: (obs, act, rew, next_obs, done)"""
+        """Bulk-add transitions with optional current/next safety bounds."""
         for t in transitions:
             if len(t) == 9:
                 obs, act, rew, next_obs, done, p_lo, p_hi, np_lo, np_hi = t
@@ -383,26 +219,7 @@ class ReplayBuffer:
 
     def sample(self, batch_size: int):
         """
-        Priority-weighted stratified sampling with IS correction.
-
-        Stratified sampling (Schaul et al. 2016 §3.3):
-          Divide [0, total) into batch_size equal segments; draw one sample
-          uniformly from each segment.  This reduces variance vs i.i.d. sampling
-          while preserving the priority-proportional distribution.
-
-        Returns 9-tuple:
-          (obs, act, rew, next_obs, done, bounds, next_bounds,
-           sample_indices, is_weights)
-
-          sample_indices : np.ndarray int64, shape (batch,)
-              Buffer indices of sampled transitions.  Pass to update_priorities()
-              after computing per-sample TD errors in train_step().
-          is_weights     : np.ndarray float32, shape (batch, 1)
-              Importance-sampling correction weights w_i = (N·P(i))^{-β},
-              normalised by max_i(w_i).  Multiply elementwise into critic loss
-              to correct the sampling bias introduced by prioritisation.
-
-        Reference: Schaul et al. (2016) arXiv:1511.05952, eqs 1–2.
+        Sample a mini-batch with PER stratification and IS weights.
         """
         total   = self._sum_tree.total
         segment = total / batch_size
@@ -414,7 +231,7 @@ class ReplayBuffer:
             mass       = min(mass, total - 1e-9)
             indices[i] = self._sum_tree.retrieve(mass)
 
-        # Sampling probabilities P(i) = p_i / total  (Schaul et al. eq 1)
+        # Sampling probabilities.
         priorities = self._sum_tree.tree[indices + self._sum_tree.capacity]
         probs      = priorities / total
 
@@ -441,40 +258,14 @@ class ReplayBuffer:
         indices:   np.ndarray,
         td_errors: np.ndarray,
     ) -> None:
-        """
-        Update transition priorities from per-sample TD errors.
-
-        Called after each train_step() with the critic TD residuals
-        returned by _update_critic().
-
-        Priority formula (Schaul et al. 2016 eq 1):
-          p_i = (|δ_i| + ε)^α
-
-        max_priority is tracked so that newly added transitions (which
-        start at max_priority) are always at least as likely to be sampled
-        as the most recently updated transition.
-
-        Parameters
-        ----------
-        indices   : int64 array, shape (batch,) — from sample() return
-        td_errors : float32 array, shape (batch,) — |Q - y| per sample
-        """
+        """Update PER priorities from per-sample TD errors."""
         priorities = (np.abs(td_errors) + self.per_eps) ** self.per_alpha
         for idx, p in zip(indices, priorities):
             self._sum_tree.update(int(idx), float(p))
         self._max_priority = max(self._max_priority, float(priorities.max()))
 
     def anneal_beta(self, fraction: float) -> None:
-        """
-        Linearly anneal the IS exponent β from β_init → 1.0.
-
-        At fraction=0 (start of training), β = β_init = 0.4 → partial IS
-        correction (biased but lower variance, aids early learning).
-        At fraction=1 (end of training), β = 1.0 → full unbiased IS
-        correction (Schaul et al. 2016 §3.4).
-
-        Call once per episode: buffer.anneal_beta(ep / total_episodes).
-        """
+        """Linearly anneal the PER importance-sampling exponent."""
         self._beta = min(
             self._beta_end,
             self._beta_init + fraction * (self._beta_end - self._beta_init),
@@ -490,97 +281,106 @@ class ReplayBuffer:
 
 class SquashedGaussianActor(tf.keras.Model):
     """
-    Stochastic actor with structured state encoder + tanh-squashed Gaussian policy.
-
-    State is split into two streams with different inductive biases:
-
-      LMP stream  obs[1:26]  (25-dim: current LMP + 24h history)
-        → Conv1D(32 filters, kernel=4, stride=1, relu)
-        → GlobalAveragePooling1D
-        → Dense(32, relu)
-        → 32-dim temporal embedding
-
-      Scalar stream  obs[0] + obs[26:36]  (11-dim: SoC, PV, step, segs×4, p_lo, p_hi, DoW, load)
-        → Dense(32, relu)
-        → 32-dim scalar embedding
-
-      Concat (64-dim) → Dense(256, relu) → Dense(256, relu) → (mu, log_std)
-
-    Rationale:
-      - Conv1D on the LMP stream learns local temporal patterns (e.g., "prices
-        rose for 4 consecutive hours → discharge now") without storing an LSTM
-        hidden state, keeping training stable and avoiding truncated-BPTT issues.
-      - GlobalAveragePooling pools over the 22-step convolution output, giving
-        translation-invariant pattern detection across the 24h window.
-      - Scalar stream encodes physical state and safety bounds via a small MLP;
-        no temporal structure is needed here.
-      - Joint trunk (256 × 2) fuses both embeddings before computing action.
-
-    Safety projection is the caller's responsibility (Convention B).
+    Dual-stream actor: Conv1D over the 25-point LMP window plus an MLP over
+    scalar state features, followed by a squashed Gaussian policy.
     """
 
     # State index constants (must match BESSEnvironment._get_obs layout)
-    _LMP_START  = 1    # obs[1..25]: current LMP + 24h history  (25 values)
+    # obs[0]     : SoC_norm
+    # obs[1:26]  : LMP window — [1..24] = lag-24..lag-1 (oldest first), [25] = current LMP
+    # obs[26]    : PV_norm
+    # obs[27]    : step_norm
+    # obs[28:32] : seg_occ (4 segments)
+    # obs[32]    : p_lo_norm
+    # obs[33]    : p_hi_norm
+    # obs[34]    : sin_dow
+    # obs[35]    : cos_dow
+    # obs[36]    : load_norm
+    # obs[37]    : wind_norm
+    _LMP_START  = 1
     _LMP_END    = 26
-    _SCALAR_IDX = [0] + list(range(26, 36))   # SoC + PV + step + segs4 + p_lo/hi + DoW + load
+    _SCALAR_IDX = [0] + list(range(26, 38))   # SoC(1) + scalars[26..37](12) = 13 total
 
     def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int = 256):
         super().__init__()
 
-        # --- LMP temporal stream ---
-        self.lmp_conv   = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
-                                                  padding="causal", activation="relu")
-        self.lmp_pool   = tf.keras.layers.GlobalAveragePooling1D()
-        self.lmp_dense  = tf.keras.layers.Dense(32, activation="relu")
+        # --- LMP multi-scale temporal stream ---
+        # Short-range: kernel=4 captures 4-hour local price spikes.
+        self.lmp_conv_short = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
+                                                      padding="causal", activation="relu")
+        # Medium-range: kernel=8 captures 8-hour intra-day price trends.
+        self.lmp_conv_long  = tf.keras.layers.Conv1D(32, kernel_size=8, strides=1,
+                                                      padding="causal", activation="relu")
+        self.lmp_pool_short = tf.keras.layers.GlobalAveragePooling1D()
+        self.lmp_pool_long  = tf.keras.layers.GlobalAveragePooling1D()
+        # Fuse 64-dim multi-scale feature → 32-dim temporal embedding
+        self.lmp_dense      = tf.keras.layers.Dense(32, activation="relu")
 
         # --- Scalar physical stream ---
         self.scalar_dense = tf.keras.layers.Dense(32, activation="relu")
+
+        # Normalize the fused embedding before the shared trunk.
+        self.joint_ln = tf.keras.layers.LayerNormalization()
 
         # --- Joint trunk ---
         self.trunk1 = tf.keras.layers.Dense(hidden_dim, activation="relu")
         self.trunk2 = tf.keras.layers.Dense(hidden_dim, activation="relu")
 
         # --- Output heads ---
-        self.mu_layer      = tf.keras.layers.Dense(act_dim)
-        self.log_std_layer = tf.keras.layers.Dense(act_dim)
+        self.mu_layer = tf.keras.layers.Dense(act_dim)
+        # Start near-deterministic and let SAC increase variance as needed.
+        self.log_std_layer = tf.keras.layers.Dense(
+            act_dim,
+            kernel_initializer="zeros",
+            bias_initializer=tf.keras.initializers.Constant(LOG_STD_MIN + 2.0),
+        )
+
+        # Pre-build the gather index used by the scalar stream.
+        self._scalar_idx_tf = tf.constant(self._SCALAR_IDX, dtype=tf.int32)
 
     def _encode(self, obs: tf.Tensor) -> tf.Tensor:
-        """Encode obs into a joint embedding via dual-stream architecture."""
-        # LMP stream: shape (batch, 25) → (batch, 25, 1) for Conv1D
-        lmp   = tf.expand_dims(obs[:, self._LMP_START:self._LMP_END], axis=-1)
-        lmp_e = self.lmp_dense(self.lmp_pool(self.lmp_conv(lmp)))   # (batch, 32)
+        """Encode the observation into the shared trunk representation."""
+        # LMP stream: (batch, 25) → (batch, 25, 1) for Conv1D
+        lmp = tf.expand_dims(obs[:, self._LMP_START:self._LMP_END], axis=-1)
 
-        # Scalar stream
-        scalar_idx = tf.constant(self._SCALAR_IDX, dtype=tf.int32)
-        scalar     = tf.gather(obs, scalar_idx, axis=1)              # (batch, 11)
-        scalar_e   = self.scalar_dense(scalar)                       # (batch, 32)
+        # Dual-scale convolution + global average pooling
+        short_e = self.lmp_pool_short(self.lmp_conv_short(lmp))   # (batch, 32)
+        long_e  = self.lmp_pool_long(self.lmp_conv_long(lmp))     # (batch, 32)
+        lmp_e   = self.lmp_dense(tf.concat([short_e, long_e], axis=-1))  # (batch, 32)
 
-        # Joint trunk
-        joint = tf.concat([lmp_e, scalar_e], axis=-1)                # (batch, 64)
-        return self.trunk2(self.trunk1(joint))                        # (batch, 256)
+        # Scalar stream (use pre-built index to avoid per-call tf.constant allocation)
+        scalar     = tf.gather(obs, self._scalar_idx_tf, axis=1)   # (batch, 13)
+        scalar_e   = self.scalar_dense(scalar)                     # (batch, 32)
+
+        # LayerNorm on concatenated embedding, then joint trunk
+        joint = self.joint_ln(tf.concat([lmp_e, scalar_e], axis=-1))  # (batch, 64) normalised
+        return self.trunk2(self.trunk1(joint))                         # (batch, 256)
 
     def _distribution_params(self, obs: tf.Tensor):
         """Return Gaussian parameters for the latent normalized action."""
+        _LOGIT_CLIP = 3.0   # mu ∈ [-3, 3]; tanh(3) = 0.995 ≈ full power
         h = self._encode(obs)
-        mu      = self.mu_layer(h)
+        mu_raw  = self.mu_layer(h)
+        mu      = _LOGIT_CLIP * tf.tanh(mu_raw)   # bounded ∈ (-3, 3)
         log_std = tf.clip_by_value(self.log_std_layer(h), LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std
 
+    # Obs indices for PTDF safety bounds (must match BESSEnvironment._get_obs layout)
+    _P_LO_IDX = 32   # obs[32] = p_lo / P_MAX  ∈ [-1, 0]
+    _P_HI_IDX = 33   # obs[33] = p_hi / P_MAX  ∈ [0, 1]
+
     def call(self, obs):
         """
-        Stochastic forward pass (used during training).
-
-        Parameters
-        ----------
-        obs : tf.Tensor, shape (batch, obs_dim)
-
-        Returns
-        -------
-        action : tf.Tensor, shape (batch, act_dim)  in (-1, 1)  — raw tanh output
-        log_pi : tf.Tensor, shape (batch, 1)  — log-prob under the squashed Gaussian
+        Sample a bounded action directly inside the current feasible interval.
         """
         mu, log_std = self._distribution_params(obs)
         std = tf.exp(log_std)
+
+        # Extract PTDF safety bounds from observation
+        p_lo_norm = obs[:, self._P_LO_IDX : self._P_LO_IDX + 1]   # (batch, 1) ∈ [-1, 0]
+        p_hi_norm = obs[:, self._P_HI_IDX : self._P_HI_IDX + 1]   # (batch, 1) ∈ [0, 1]
+        center     = (p_hi_norm + p_lo_norm) * 0.5   # ∈ [-0.5, 0.5]
+        half_width = (p_hi_norm - p_lo_norm) * 0.5   # ∈ [0, 1]
 
         # Reparameterization trick
         eps = tf.random.normal(tf.shape(mu))
@@ -593,99 +393,106 @@ class SquashedGaussianActor(tf.keras.Model):
         )
         log_pi_normal = tf.reduce_sum(log_pi_normal, axis=-1, keepdims=True)
 
-        # Tanh squashing correction: sum_i log(1 - tanh(z_i)^2)
+        # Tanh squashing correction (same formula as standard SAC)
         squash_correction = tf.reduce_sum(
             tf.math.log(1.0 - tf.tanh(z) ** 2 + 1e-6),
             axis=-1, keepdims=True,
         )
 
-        log_pi = log_pi_normal - squash_correction
-        action = tf.tanh(z)   # raw action in (-1, 1); projection applied in actor-update step
+        # Width penalty for narrow feasible intervals.
+        half_width_safe = tf.maximum(half_width, 0.1)
+        log_pi = log_pi_normal - tf.math.log(half_width_safe) - squash_correction
+
+        # Bounded action: center + half_width * tanh(z)  ∈ [p_lo_norm, p_hi_norm]
+        action = center + half_width * tf.tanh(z)
         return action, log_pi
 
     def get_deterministic_action(self, obs):
-        """
-        Deterministic forward pass. Returns tanh(mu) in (-1, 1).
-        Used during evaluation (no exploration noise).
-        Projection to the feasible interval is the caller's responsibility.
-        """
+        """Return the deterministic bounded action used at evaluation time."""
         mu, _ = self._distribution_params(obs)
-        return tf.tanh(mu)
+        p_lo_norm = obs[:, self._P_LO_IDX : self._P_LO_IDX + 1]
+        p_hi_norm = obs[:, self._P_HI_IDX : self._P_HI_IDX + 1]
+        center     = (p_hi_norm + p_lo_norm) * 0.5
+        half_width = (p_hi_norm - p_lo_norm) * 0.5
+        return center + half_width * tf.tanh(mu)
 
 
 class TwinQCritic(tf.keras.Model):
     """
-    Twin Q-networks in a single keras.Model (Q1 and Q2 share no weights).
-
-    Architecture for each Qi uses the same dual-stream encoder as the actor,
-    with action appended to the scalar stream (not to raw obs) so the critic
-    sees the action in the same semantic space as the physical state variables:
-
-      LMP stream  obs[1:26]  → Conv1D(32) → GAP → Dense(32) → 32-dim
-      Scalar+act  [obs_scalars, act]  → Dense(32) → 32-dim
-      Concat (64) → Dense(256, relu) → Dense(256, relu) → Dense(1)
-
-    Using min(Q1, Q2) for target value reduces overestimation bias (Fujimoto 2018).
+    Twin Q-networks with the same dual-stream encoder structure as the actor.
     """
 
+    # State index constants — must match BESSEnvironment._get_obs and Actor._SCALAR_IDX.
+    # obs[0]:    SoC_norm
+    # obs[1:26]: LMP window (25 dims)
+    # obs[26:38]: 12 scalar features (PV, step, seg_occ×4, p_lo, p_hi, sin_dow, cos_dow, load, wind)
     _LMP_START  = 1
     _LMP_END    = 26
-    _SCALAR_IDX = [0] + list(range(26, 36))
+    _SCALAR_IDX = [0] + list(range(26, 38))   # 13 scalars total (matches Actor)
 
     def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int = 256):
         super().__init__()
 
-        # Q1 dual-stream encoder
-        self.q1_lmp_conv   = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
-                                                     padding="causal", activation="relu")
-        self.q1_lmp_pool   = tf.keras.layers.GlobalAveragePooling1D()
-        self.q1_lmp_dense  = tf.keras.layers.Dense(32, activation="relu")
-        self.q1_scalar     = tf.keras.layers.Dense(32, activation="relu")
-        self.q1_fc1        = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.q1_fc2        = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.q1_out        = tf.keras.layers.Dense(1)
+        # Q1 multi-scale dual-stream encoder
+        self.q1_lmp_conv_short = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
+                                                         padding="causal", activation="relu")
+        self.q1_lmp_conv_long  = tf.keras.layers.Conv1D(32, kernel_size=8, strides=1,
+                                                         padding="causal", activation="relu")
+        self.q1_lmp_pool_short = tf.keras.layers.GlobalAveragePooling1D()
+        self.q1_lmp_pool_long  = tf.keras.layers.GlobalAveragePooling1D()
+        self.q1_lmp_dense      = tf.keras.layers.Dense(32, activation="relu")
+        self.q1_scalar         = tf.keras.layers.Dense(32, activation="relu")
+        self.q1_joint_ln       = tf.keras.layers.LayerNormalization()
+        self.q1_fc1            = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.q1_fc2            = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.q1_out            = tf.keras.layers.Dense(1)
 
-        # Q2 dual-stream encoder (identical architecture, separate weights)
-        self.q2_lmp_conv   = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
-                                                     padding="causal", activation="relu")
-        self.q2_lmp_pool   = tf.keras.layers.GlobalAveragePooling1D()
-        self.q2_lmp_dense  = tf.keras.layers.Dense(32, activation="relu")
-        self.q2_scalar     = tf.keras.layers.Dense(32, activation="relu")
-        self.q2_fc1        = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.q2_fc2        = tf.keras.layers.Dense(hidden_dim, activation="relu")
-        self.q2_out        = tf.keras.layers.Dense(1)
+        # Q2 multi-scale dual-stream encoder (identical architecture, separate weights)
+        self.q2_lmp_conv_short = tf.keras.layers.Conv1D(32, kernel_size=4, strides=1,
+                                                         padding="causal", activation="relu")
+        self.q2_lmp_conv_long  = tf.keras.layers.Conv1D(32, kernel_size=8, strides=1,
+                                                         padding="causal", activation="relu")
+        self.q2_lmp_pool_short = tf.keras.layers.GlobalAveragePooling1D()
+        self.q2_lmp_pool_long  = tf.keras.layers.GlobalAveragePooling1D()
+        self.q2_lmp_dense      = tf.keras.layers.Dense(32, activation="relu")
+        self.q2_scalar         = tf.keras.layers.Dense(32, activation="relu")
+        self.q2_joint_ln       = tf.keras.layers.LayerNormalization()
+        self.q2_fc1            = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.q2_fc2            = tf.keras.layers.Dense(hidden_dim, activation="relu")
+        self.q2_out            = tf.keras.layers.Dense(1)
 
-    def _encode_one(self, obs, act, lmp_conv, lmp_pool, lmp_dense, scalar_dense, fc1, fc2, out):
-        """Shared encoding logic for one Q-network."""
-        lmp    = tf.expand_dims(obs[:, self._LMP_START:self._LMP_END], axis=-1)
-        lmp_e  = lmp_dense(lmp_pool(lmp_conv(lmp)))
+        # Pre-built index tensor shared by Q1 and Q2 scalar streams.
+        self._scalar_idx_tf = tf.constant(self._SCALAR_IDX, dtype=tf.int32)
 
-        scalar_idx = tf.constant(self._SCALAR_IDX, dtype=tf.int32)
-        scalar     = tf.gather(obs, scalar_idx, axis=1)
-        scalar_e   = scalar_dense(tf.concat([scalar, act], axis=-1))   # action in scalar stream
+    def _encode_one(self, obs, act,
+                    lmp_cs, lmp_cl, lmp_ps, lmp_pl, lmp_d,
+                    scalar_d, joint_ln, fc1, fc2, out):
+        """Shared encoder path for one critic head."""
+        lmp = tf.expand_dims(obs[:, self._LMP_START:self._LMP_END], axis=-1)
 
-        joint = tf.concat([lmp_e, scalar_e], axis=-1)
+        short_e = lmp_ps(lmp_cs(lmp))                             # (batch, 32)
+        long_e  = lmp_pl(lmp_cl(lmp))                             # (batch, 32)
+        lmp_e   = lmp_d(tf.concat([short_e, long_e], axis=-1))    # (batch, 32)
+
+        scalar     = tf.gather(obs, self._scalar_idx_tf, axis=1)
+        scalar_e   = scalar_d(tf.concat([scalar, act], axis=-1))   # action in scalar stream
+
+        joint = joint_ln(tf.concat([lmp_e, scalar_e], axis=-1))   # (batch, 64) normalised
         return out(fc2(fc1(joint)))
 
     def call(self, inputs):
-        """
-        Parameters
-        ----------
-        inputs : list [obs, act]
-            obs : tf.Tensor, shape (batch, obs_dim)
-            act : tf.Tensor, shape (batch, act_dim)
-
-        Returns
-        -------
-        q1, q2 : tf.Tensor, shape (batch, 1) each
-        """
+        """Return Q1 and Q2 for a batch of observations and actions."""
         obs, act = inputs
         q1 = self._encode_one(obs, act,
-                               self.q1_lmp_conv, self.q1_lmp_pool, self.q1_lmp_dense,
-                               self.q1_scalar, self.q1_fc1, self.q1_fc2, self.q1_out)
+                               self.q1_lmp_conv_short, self.q1_lmp_conv_long,
+                               self.q1_lmp_pool_short, self.q1_lmp_pool_long,
+                               self.q1_lmp_dense, self.q1_scalar, self.q1_joint_ln,
+                               self.q1_fc1, self.q1_fc2, self.q1_out)
         q2 = self._encode_one(obs, act,
-                               self.q2_lmp_conv, self.q2_lmp_pool, self.q2_lmp_dense,
-                               self.q2_scalar, self.q2_fc1, self.q2_fc2, self.q2_out)
+                               self.q2_lmp_conv_short, self.q2_lmp_conv_long,
+                               self.q2_lmp_pool_short, self.q2_lmp_pool_long,
+                               self.q2_lmp_dense, self.q2_scalar, self.q2_joint_ln,
+                               self.q2_fc1, self.q2_fc2, self.q2_out)
         return q1, q2
 
 
@@ -695,18 +502,7 @@ class TwinQCritic(tf.keras.Model):
 
 class SACAgent:
     """
-    Soft Actor-Critic agent (Haarnoja et al., SAC-v2, 2018).
-
-    Key features:
-      - Twin Q-critics with soft target updates (Polyak averaging)
-      - Automatic entropy tuning via trainable log_alpha
-      - All three gradient steps decorated with @tf.function for speed
-
-    Parameters
-    ----------
-    obs_dim : int   -- observation space dimensionality (36)
-    act_dim : int   -- action space dimensionality (1)
-    hp      : dict  -- hyperparameter dict (see HP at top of file)
+    Soft Actor-Critic agent with twin critics and automatic entropy tuning.
     """
 
     def __init__(self, obs_dim: int, act_dim: int, hp: dict):
@@ -730,26 +526,29 @@ class SACAgent:
         self.critic([_dummy_obs, _dummy_act])
         self.critic_target([_dummy_obs, _dummy_act])
 
+        # Pre-trace the per-step actor calls used during rollout and evaluation.
+        self._tf_act_stoch = tf.function(
+            lambda obs: self.actor(obs),
+            reduce_retracing=True,
+        )
+        self._tf_act_det = tf.function(
+            lambda obs: self.actor.get_deterministic_action(obs),
+            reduce_retracing=True,
+        )
+
         # Initialise target == online critic
         self.critic_target.set_weights(self.critic.get_weights())
 
-        # --- Optimizers (same lr for all three, gradient clipping) ---
-        # global_clipnorm=1.0 clips ALL parameter gradients jointly so their
-        # combined L2-norm is ≤1.0. 
+        # --- Optimizers ---
+        # Use gradient clipping for stability.
         lr = hp["lr"]
         alpha_lr = float(hp.get("alpha_lr", lr))
-        self.actor_opt  = tf.keras.optimizers.Adam(lr, global_clipnorm=1.0)
-        self.critic_opt = tf.keras.optimizers.Adam(lr, global_clipnorm=1.0)
-        self.alpha_opt  = tf.keras.optimizers.Adam(alpha_lr, global_clipnorm=1.0)
+        self.actor_opt  = tf.keras.optimizers.Adam(lr, global_clipnorm=2.0)
+        self.critic_opt = tf.keras.optimizers.Adam(lr, global_clipnorm=2.0)
+        self.alpha_opt  = tf.keras.optimizers.Adam(alpha_lr, global_clipnorm=0.5)
 
         # --- Entropy coefficient (automatic tuning) ---
-        # log_alpha is the trainable scalar; alpha = exp(log_alpha).
-        # We initialise to hp['init_alpha'] (default 0.01) instead of the
-        # SAC-paper default of 1.0.  With REWARD_SCALE=1e-3, per-step rewards
-        # are O(0.001); alpha=1.0 overwhelms the Q-signal by ~500× for the
-        # first 100 episodes, causing the actor to optimise pure entropy and
-        # the alpha decay mechanism to crash alpha to ~0.0003 before the critic
-        # converges.  
+        # log_alpha is trainable and alpha = exp(log_alpha).
         _init_alpha = float(hp.get("init_alpha", 0.01))
         self.log_alpha      = tf.Variable(
             math.log(_init_alpha), trainable=True, dtype=tf.float32
@@ -760,16 +559,11 @@ class SACAgent:
         # Hard lower bound: alpha never falls below alpha_min.
         _alpha_min = float(hp.get("alpha_min", 0.0005))
         self._log_alpha_min = tf.constant(math.log(_alpha_min), dtype=tf.float32)
-        # Hard upper bound: alpha never exceeds alpha_max.
-        # Without this, BC warmstart (bang-bang LP oracle saturates tanh → log_pi > 0)
-        # causes alpha to explode exponentially, drowning the Q-signal.
+        # Hard upper bound on alpha.
         _alpha_max = float(hp.get("alpha_max", 1.0))
         self._log_alpha_max = tf.constant(math.log(_alpha_max), dtype=tf.float32)
 
-        # Keras 3 tracks variables per optimizer on first apply_gradients().
-        # BC pretrain may touch only a subset of actor params (mu head), so
-        # pre-build optimizers with the FULL variable sets to avoid
-        # "Unknown variable" errors later in SAC updates.
+        # Pre-build optimizer state for the full variable sets.
         for _opt, _vars in (
             (self.actor_opt, self.actor.trainable_variables),
             (self.critic_opt, self.critic.trainable_variables),
@@ -785,11 +579,7 @@ class SACAgent:
         # --- Anticipatory projection penalty weight ---
         self.proj_lambda = tf.constant(hp.get("proj_lambda", 0.1), dtype=tf.float32)
 
-        # --- N-step return parameters ---
-        # n_step: how many steps of actual rewards are summed before
-        # bootstrapping. The buffer stores the pre-computed N-step sum
-        # G_t^N, so the critic target uses gamma^N (not gamma) as the
-        # discount on the bootstrap value V(s_{t+N}).
+        # Discount factor applied to the stored N-step return target.
         self.n_step  = int(hp.get("n_step", 1))
         self.gamma_n = tf.constant(
             self.gamma ** self.n_step, dtype=tf.float32
@@ -811,51 +601,26 @@ class SACAgent:
         rew:         tf.Tensor,
         next_obs:    tf.Tensor,
         done:        tf.Tensor,
-        next_bounds: tf.Tensor,   # (batch, 2)  safety bounds at s_{t+N}
         is_weights:  tf.Tensor,   # (batch, 1)  PER importance-sampling weights
     ):
         """
-        Compute and apply IS-weighted critic gradients (PER-aware).
-
-        N-step target (n_step=1 reduces to standard 1-step SAC):
-          y = G_t^N + gamma^N*(1-done_N)*[min(Q1',Q2')(s_{t+N}, a'_proj)
-                                           - alpha*log_pi(a'|s_{t+N})]
-        where a'_proj = clip(a', next_p_lo, next_p_hi) enforces Convention B:
-        the critic is trained on projected actions and must also be evaluated
-        at projected actions in the target to avoid off-distribution Q-bias.
-        next_bounds (stored in the replay buffer via the N+1 look-ahead window)
-        provides the exact safety bounds at s_{t+N}.
-
-        IS-weighted loss (Schaul et al. 2016, eq 9):
-          JQ = 0.5 * mean[ w_i * ((Q1_i - y_i)^2 + (Q2_i - y_i)^2) ]
-        When all w_i = 1 (uniform sampling) this reduces exactly to the
-        standard SAC critic loss (SAC-v2 paper eq 5): 0.5*mean[(Q1-y)^2+(Q2-y)^2].
-
-        Returns
-        -------
-        critic_loss : scalar Tensor — IS-weighted mean squared TD error
-        td_errors   : Tensor shape (batch,) — per-sample |δ_i| for priority update
-                      δ_i = 0.5*(|Q1_i - y_i| + |Q2_i - y_i|)
-                      Computed from Q values BEFORE the weight update (standard PER).
+        Apply one IS-weighted critic update and return TD errors for PER.
         """
-        # Sample next action from the stochastic policy.
+        # Actor already outputs actions inside the feasible interval.
         next_act, next_log_pi = self.actor(next_obs)
 
-        # Project next action to next-state safety bounds (Convention B fix)
-        next_p_lo = next_bounds[:, :1]   # (batch, 1)
-        next_p_hi = next_bounds[:, 1:]   # (batch, 1)
-        next_act_proj = tf.clip_by_value(next_act, next_p_lo, next_p_hi)
-
-        # Clamp log_pi to prevent critic target corruption when tanh saturates.
-        # After BC warmstart, log_pi can be +5 to +8 (squash correction artifact).
-        # alpha * log_pi in the target would then be O(1000s) vs Q O(0.001).
+        # Clamp log_pi to keep targets numerically stable.
         next_log_pi = tf.clip_by_value(next_log_pi, -20.0, 2.0)
 
-        # N-step target Q values (stop_gradient: treated as a constant label)
-        q1_next, q2_next = self.critic_target([next_obs, next_act_proj])
+        # N-step target Q values.
+        q1_next, q2_next = self.critic_target([next_obs, next_act])
         min_q_next = tf.minimum(q1_next, q2_next)
+        # Clamp the target to keep early critic updates bounded.
         q_target = tf.stop_gradient(
-            rew + self.gamma_n * (1.0 - done) * (min_q_next - self.alpha * next_log_pi)
+            tf.clip_by_value(
+                rew + self.gamma_n * (1.0 - done) * (min_q_next - self.alpha * next_log_pi),
+                -100.0, 100.0,
+            )
         )
 
         # IS-weighted critic gradient step.
@@ -872,8 +637,7 @@ class SACAgent:
             zip(grads, self.critic.trainable_variables)
         )
 
-        # Per-sample TD errors for priority update (Schaul et al. 2016 eq 1).
-        # Averaged over both critics; computed from Q values BEFORE the step.
+        # Per-sample TD errors for the next PER priority update.
         td_errors = tf.squeeze(
             0.5 * (tf.abs(q1 - q_target) + tf.abs(q2 - q_target)),
             axis=1,
@@ -881,35 +645,19 @@ class SACAgent:
         return critic_loss, td_errors
 
     @tf.function
-    def _update_actor(self, obs: tf.Tensor, bounds: tf.Tensor) -> tf.Tensor:
+    def _update_actor(self, obs: tf.Tensor) -> tf.Tensor:
         """
-        Compute and apply actor gradients.
-
-        Convention B (differentiable projection, no CVXPYLayers needed):
-          1. Actor proposes a_raw = tanh(z) in (-1, 1).
-          2. Clip to stored safety bounds [p_lo, p_hi] -> a_proj.
-             tf.clip_by_value: grad = 1 when in bounds, 0 when clipped.
-             For this 1-D linear QP this IS the exact KKT gradient.
-          3. Q is evaluated at a_proj (consistent with critic training).
-          4. Anticipatory penalty ||a_raw - a_proj||^2 restores non-zero
-             gradient at the ~86% of steps where PTDF binding makes the
-             clip active (where Q-gradient alone would be zero).
-
-        Loss = E[alpha * log_pi(a_raw|s)           (entropy on raw dist.)
-                - min(Q1,Q2)(s, a_proj)             (value at projected act.)
-                + proj_lambda * ||a_raw-a_proj||^2] (anticipatory penalty)
+        Apply one actor update using bounded actions from the policy.
         """
-        p_lo = bounds[:, :1]   # (batch, 1)  normalised lower bound
-        p_hi = bounds[:, 1:]   # (batch, 1)  normalised upper bound
-
         with tf.GradientTape() as tape:
-            act, log_pi = self.actor(obs)                              # a_raw in (-1, 1)
-            act_proj = tf.clip_by_value(act, p_lo, p_hi)              # project to feasible interval
-            q1, q2 = self.critic([obs, act_proj])                     # Convention B: Q at projected action
+            act, log_pi = self.actor(obs)    # a_safe in [p_lo_norm, p_hi_norm]
+            # Clamp log_pi (same as _update_critic for consistency).
+            # With bounded-tanh: max log_pi ≈ +1 for blocked steps → safely below 2.0.
+            log_pi = tf.clip_by_value(log_pi, -20.0, 2.0)
+            q1, q2 = self.critic([obs, act])          # Q at safe action
             min_q   = tf.minimum(q1, q2)
-            proj_pen = tf.reduce_mean(tf.square(act - act_proj))      # should stay ~0
-            actor_loss = (tf.reduce_mean(self.alpha * log_pi - min_q)
-                          + self.proj_lambda * proj_pen)
+            proj_pen = tf.constant(0.0)               # no projection needed (kept for log API)
+            actor_loss = tf.reduce_mean(self.alpha * log_pi - min_q)
 
         grads = tape.gradient(actor_loss, self.actor.trainable_variables)
         self.actor_opt.apply_gradients(
@@ -918,45 +666,15 @@ class SACAgent:
         return actor_loss, proj_pen
 
     @tf.function
-    def _bc_actor_step(self, obs: tf.Tensor, act_expert: tf.Tensor) -> tf.Tensor:
-        """
-        One behavior-cloning gradient step on expert actions.
-
-        Uses deterministic feasible policy output and MSE loss:
-          L_BC = E[ ||a_det(s) - a_expert||^2 ].
-        """
-        with tf.GradientTape() as tape:
-            act_det = self.actor.get_deterministic_action(obs)
-            bc_loss = tf.reduce_mean(tf.square(act_det - act_expert))
-
-        grads = tape.gradient(bc_loss, self.actor.trainable_variables)
-        grads_and_vars = [
-            (g, v)
-            for g, v in zip(grads, self.actor.trainable_variables)
-            if g is not None
-        ]
-        self.actor_opt.apply_gradients(grads_and_vars)
-        return bc_loss
-
-    @tf.function
     def _update_alpha(self, obs: tf.Tensor) -> tf.Tensor:
         """
-        Update log_alpha to match target entropy.
-
-        Practical log_alpha surrogate for the SAC temperature update.
-
-        The sign matches the Eq. 18 dual descent direction, while avoiding
-        the vanishing-gradient effect of alpha * (...) once alpha becomes
-        very small.
-
-        After the gradient step a hard lower bound is enforced:
-          log_alpha >= log(alpha_min)
-        This prevents alpha from collapsing to zero when the policy is
-        concentrated near tanh boundaries (e.g. post LP warm-start), which
-        would eliminate entropy regularisation and destabilise the critic.
+        Update the entropy coefficient toward the target entropy.
         """
         with tf.GradientTape() as tape:
             _, log_pi = self.actor(obs)
+            # Clamp before stop_gradient so the clamped value is what alpha tracks.
+            # 2.0 (not 4.0): consistent with _update_critic and _update_actor.
+            log_pi = tf.clip_by_value(log_pi, -20.0, 2.0)
             # Stop gradient: log_pi is a constant label for alpha update
             alpha_loss = -tf.reduce_mean(
                 self.log_alpha * tf.stop_gradient(log_pi + self.target_entropy)
@@ -983,42 +701,26 @@ class SACAgent:
     # ------------------------------------------------------------------
 
     def train_step(self, buffer: ReplayBuffer) -> dict:
-        """
-        Sample a PER mini-batch and perform one SAC gradient step.
-
-        Steps:
-          1. Stratified-priority sample from buffer (returns IS weights +
-             buffer indices for later priority update).
-          2. IS-weighted critic update; critic returns per-sample TD errors.
-          3. Actor + alpha updates (uniform weights — standard SAC-v2).
-          4. Polyak target update.
-          5. Push new priorities back to the SumTree.
-
-        Returns dict of scalar metrics.
-        """
+        """Run one SAC update from a replay-buffer mini-batch."""
         (obs, act, rew, next_obs, done,
-         bounds, next_bounds,
+         _bounds, _next_bounds,
          sample_indices, is_weights) = buffer.sample(self.batch_size)
 
-        # Pass numpy arrays directly — @tf.function on the inner methods handles
-        # conversion without creating persistent constant graph nodes.
-        # tf.constant() inside a Python loop accumulates graph nodes on Metal backend,
-        # causing episode time to grow 4× over 1000 episodes → OOM kill.
+        # Pass numpy arrays directly to avoid building extra TensorFlow constants
+        # in the Python training loop.
         obs_tf          = obs.astype(np.float32)
         act_tf          = act.astype(np.float32)
         rew_tf          = rew.astype(np.float32)
         next_obs_tf     = next_obs.astype(np.float32)
         done_tf         = done.astype(np.float32)
-        bounds_tf       = bounds.astype(np.float32)       # (batch, 2) at s_t
-        next_bounds_tf  = next_bounds.astype(np.float32)  # (batch, 2) at s_{t+N}
         is_weights_tf   = is_weights.astype(np.float32)   # (batch, 1)
 
         # IS-weighted critic update; returns per-sample |δ_i| for PER
         critic_loss, td_errors = self._update_critic(
-            obs_tf, act_tf, rew_tf, next_obs_tf, done_tf, next_bounds_tf,
+            obs_tf, act_tf, rew_tf, next_obs_tf, done_tf,
             is_weights_tf,
         )
-        actor_loss, proj_pen   = self._update_actor(obs_tf, bounds_tf)
+        actor_loss, proj_pen   = self._update_actor(obs_tf)
         alpha_loss             = self._update_alpha(obs_tf)
         self._soft_update_target()
 
@@ -1034,23 +736,13 @@ class SACAgent:
         }
 
     def act(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
-        """
-        Select an action for a single observation.
-
-        Parameters
-        ----------
-        obs          : np.ndarray, shape (obs_dim,)
-        deterministic: bool -- use tanh(mu) instead of sampling
-
-        Returns
-        -------
-        np.ndarray, shape (act_dim,) in (-1, 1)  — ready for env.step()
-        """
-        obs_tf = tf.constant(obs[np.newaxis], dtype=tf.float32)  # (1, obs_dim)
+        """Select one action for a single observation."""
+        # Use the pre-traced wrappers created in __init__.
+        obs_tf = obs[np.newaxis].astype(np.float32)  # (1, obs_dim) — fixed shape → single trace
         if deterministic:
-            act_tf = self.actor.get_deterministic_action(obs_tf)
+            act_tf = self._tf_act_det(obs_tf)
         else:
-            act_tf, _ = self.actor(obs_tf)
+            act_tf, _ = self._tf_act_stoch(obs_tf)
         return act_tf.numpy()[0]   # shape (act_dim,) = (1,)
 
     def save(self, path: str) -> None:
@@ -1072,143 +764,250 @@ class SACAgent:
 
 
 # ================================================================
-# PERFECT FORESIGHT LP ORACLE  (single-bus, simplified degradation)
+# PERFECT FORESIGHT LP ORACLE  (multi-segment Xu et al. 2017)
 # ================================================================
 
 class PerfectForesightLP:
     """
-    Compute the maximum profit achievable with perfect foresight of all
-    future LMPs over one episode.  Serves as a warm-start expert.
+    Multi-segment perfect-foresight LP used for warm-start trajectories.
 
-    Formulation (LP, scipy linprog, HiGHS solver):
-    ------------------------------------------------
-    Variables: x = [p_dis(0..T-1), p_ch(0..T-1)]  in R^{2T},  x >= 0
-
-    Objective (minimise = maximise profit):
-      c_obj[t]   = c_dis - lmp[t]   for t in 0..T-1   (discharge term)
-      c_obj[T+t] = lmp[t]           for t in 0..T-1   (charging term)
-
-    SoC dynamics (dt = 1 h):
-      SoC[t] = SoC_0 + sum_{s=0}^{t-1} [ p_ch[s]*eta_ch - p_dis[s]/eta_dis ]
-
-    Inequality constraints A_ub @ x <= b_ub  (shape 2T x 2T):
-      SoC >= SoC_min:  sum_{s<t} [ p_dis[s]/eta_dis - p_ch[s]*eta_ch ] <= SoC_0 - SoC_min
-      SoC <= SoC_max: -sum_{s<t} [ p_dis[s]/eta_dis - p_ch[s]*eta_ch ] <= SoC_max - SoC_0
-
-    Box bounds: 0 <= p_dis[t] <= P_max,  0 <= p_ch[t] <= P_max
-
-    Notes:
-      - No network constraints (LP is a single-bus oracle).
-      - c_dis is set with an economics-aware conservative approximation:
-          • determine deepest potentially profitable degradation segment from
-            observed LMP_max at the BESS bus;
-          • restrict SoC_min to exclude clearly unprofitable deeper segments;
-          • set c_dis to the overlap-weighted mean segment cost over
-            [SoC_min, SoC_max], converted to $/MWh delivered (divide by eta_dis).
-        This keeps warm-start transitions aligned with current market economics
-        without assuming the old "segment-1 only" regime.
-      - Simultaneous charge/discharge will not occur at optimum when prices > 0.
+    The formulation follows the Xu-style segment model for degradation and adds
+    PTDF-based network limits so expert actions respect the same feasibility
+    structure as the environment.
     """
 
     def __init__(self, env: BESSEnv):
-        self.T       = env.EPS_LEN
-        self.P_max   = env.P_MAX
-        self.SoC_0   = env.SOC_INIT
-        self.SoC_max = env.SOC_MAX
-        self.eta_ch  = env.ETA_CH
-        self.eta_dis = env.ETA_DIS
+        from scipy.sparse import lil_matrix as _lil
 
-        # Economics-aware depth gating:
-        # segments with breakeven above observed LMP_max are excluded from the LP.
-        lmp_bus = env.lmps[env.converged, env.bess_col]
-        lmp_max = float(np.max(lmp_bus)) if len(lmp_bus) else 0.0
-        self.lmp_max = lmp_max
-        breakeven = env.c_deg / env.ETA_DIS
-        profitable = np.where(lmp_max >= breakeven)[0]
-        deepest_profitable = int(profitable[-1] + 1) if len(profitable) else 1
-        self.deepest_profitable_seg = deepest_profitable
-        self.SoC_min = max(
-            env.SOC_MIN,
-            env.E_CAP - deepest_profitable * env.SEG_SIZE,
+        self.T        = env.EPS_LEN
+        self.J        = env.J_DEG
+        self.P_max    = env.P_MAX
+        self.SoC_max  = env.SOC_MAX
+        self.eta_ch   = env.ETA_CH
+        self.eta_dis  = env.ETA_DIS
+        self.seg_size = env.SEG_SIZE
+        self.c_j      = env.c_deg.copy()    # shape (J,) [$/MWh extracted from battery]
+
+        # PTDF data for episode-level network bounds.
+        _PTDF_THRESH  = 1e-5
+        self.ptdf_k   = env.ptdf_k.astype(np.float64)     # (120,) PTDF of BESS bus
+        self.f_lmax   = env.f_lmax.astype(np.float64)     # (120,) line ratings [MW]
+        self.active   = np.abs(self.ptdf_k) > _PTDF_THRESH  # (120,) bool
+
+        # Physical SoC minimum only; no artificial depth gate.
+        self.SoC_min = env.SOC_MIN
+
+        # Initial segment energies implied by SOC_INIT.
+        self.e0 = self._initial_seg_energies(env.SOC_INIT)
+
+        # Pre-build the static LP structure.
+        T, J = self.T, self.J
+        n_vars = 3 * T * J
+
+        # Variable block offsets
+        i_dis = 0           # p_dis[t,j] at x[i_dis + t*J + j]
+        i_ch  = T * J       # p_ch[t,j]  at x[i_ch  + t*J + j]
+        i_e   = 2 * T * J   # e[t,j]     at x[i_e   + t*J + j]
+
+        # ----------------------------------------------------------------
+        # Equality constraints: energy balance (T*J rows)
+        # ----------------------------------------------------------------
+        A_eq = _lil((T * J, n_vars), dtype=np.float64)
+        b_eq = np.zeros(T * J, dtype=np.float64)
+
+        for t in range(T):
+            for j in range(J):
+                row = t * J + j
+                A_eq[row, i_e   + t * J + j] =  1.0
+                A_eq[row, i_dis + t * J + j] =  1.0 / self.eta_dis
+                A_eq[row, i_ch  + t * J + j] = -self.eta_ch
+                if t == 0:
+                    b_eq[row] = self.e0[j]
+                else:
+                    A_eq[row, i_e + (t - 1) * J + j] = -1.0
+                    # b_eq[row] = 0.0  (already initialised)
+
+        # ----------------------------------------------------------------
+        # Inequality constraints: power rating + SoC bounds (4T rows)
+        # ----------------------------------------------------------------
+        A_ub = _lil((4 * T, n_vars), dtype=np.float64)
+        b_ub = np.zeros(4 * T, dtype=np.float64)
+
+        for t in range(T):
+            for j in range(J):
+                A_ub[t,           i_dis + t * J + j] =  1.0   # Σ p_dis ≤ P_max
+                A_ub[T + t,       i_ch  + t * J + j] =  1.0   # Σ p_ch  ≤ P_max
+                A_ub[2 * T + t,   i_e   + t * J + j] = -1.0   # −Σ e    ≤ −SoC_min
+                A_ub[3 * T + t,   i_e   + t * J + j] =  1.0   # Σ e     ≤  SoC_max
+            b_ub[t]           = self.P_max
+            b_ub[T + t]       = self.P_max
+            b_ub[2 * T + t]   = -self.SoC_min
+            b_ub[3 * T + t]   = self.SoC_max
+
+        # ----------------------------------------------------------------
+        # PTDF inequality constraints: net-injection bounds (2T rows, STATIC structure)
+        # ----------------------------------------------------------------
+        # Row t      (0..T-1): Σ_j p_dis[t,j] − Σ_j p_ch[t,j] ≤ p_hi_ptdf[t]
+        # Row T+t (T..2T-1): −Σ_j p_dis[t,j] + Σ_j p_ch[t,j] ≤ −p_lo_ptdf[t]
+        #
+        # The coefficient matrix is STATIC (same for every episode); only the RHS
+        # b_ptdf = [p_hi_ptdf[0..T-1], −p_lo_ptdf[0..T-1]] is episode-dependent and
+        # recomputed in solve() from the episode's baseline line flows f_base_episode.
+        A_ptdf = _lil((2 * T, n_vars), dtype=np.float64)
+        for t in range(T):
+            for j in range(J):
+                A_ptdf[t,       i_dis + t * J + j] =  1.0   # +p_dis → upper net bound
+                A_ptdf[t,       i_ch  + t * J + j] = -1.0   # −p_ch  → upper net bound
+                A_ptdf[T + t,   i_dis + t * J + j] = -1.0   # −p_dis → lower net bound
+                A_ptdf[T + t,   i_ch  + t * J + j] =  1.0   # +p_ch  → lower net bound
+
+        # ----------------------------------------------------------------
+        # Box bounds
+        # ----------------------------------------------------------------
+        self._lp_bounds = (
+            [(0.0, self.P_max)]      * (T * J)   # p_dis
+            + [(0.0, self.P_max)]    * (T * J)   # p_ch
+            + [(0.0, self.seg_size)] * (T * J)   # e (per-segment capacity)
         )
 
-        # Conservative single-coefficient approximation over the allowed SoC band.
-        # c_j is in $/MWh extracted; convert to $/MWh delivered via /eta_dis.
-        weights = []
-        costs = []
-        for j in range(1, env.J_DEG + 1):
-            seg_upper = env.E_CAP - (j - 1) * env.SEG_SIZE
-            seg_lower = env.E_CAP - j * env.SEG_SIZE
-            overlap = max(0.0, min(self.SoC_max, seg_upper) - max(self.SoC_min, seg_lower))
-            if overlap > 1e-9:
-                weights.append(overlap)
-                costs.append(env.c_deg[j - 1] / env.ETA_DIS)
-        if weights:
-            self.c_dis = float(np.dot(weights, costs) / np.sum(weights))
-        else:
-            self.c_dis = float(env.c_deg[0] / env.ETA_DIS)
+        self._A_eq   = A_eq.tocsr()
+        self._b_eq   = b_eq
+        self._A_ub   = A_ub.tocsr()
+        self._b_ub   = b_ub
+        self._A_ptdf = A_ptdf.tocsr()   # static PTDF coefficient matrix
 
-        self._build_constraint_matrix()
+    def _initial_seg_energies(self, soc: float) -> np.ndarray:
+        """Decompose scalar SoC into shallow-to-deep segment energies."""
+        E_cap = self.J * self.seg_size
+        e0 = np.zeros(self.J, dtype=np.float64)
+        for j in range(self.J):
+            seg_upper = E_cap - j * self.seg_size
+            seg_lower = E_cap - (j + 1) * self.seg_size
+            e0[j] = max(0.0, min(soc, seg_upper) - max(seg_lower, 0.0))
+        return e0
 
-    def _build_constraint_matrix(self) -> None:
-        """Pre-build the (2T x 2T) inequality constraint matrix."""
-        T = self.T
+    def _ptdf_bounds_episode(
+        self, f_base_episode: np.ndarray
+    ) -> tuple:
+        """Vectorized PTDF net-injection bounds for one episode."""
+        T   = min(self.T, len(f_base_episode))
+        fb  = np.asarray(f_base_episode[:T], dtype=np.float64)   # (T, 120)
 
-        # Lower-triangular cumulative matrix:
-        #   L[i, j] = 1 if j <= i (sum_{s=0}^{t-1} over rows t=1..T)
-        L = np.tril(np.ones((T, T), dtype=np.float64))
+        ptdf_act = self.ptdf_k[self.active]   # (n_act,)
+        f_lim    = self.f_lmax[self.active]   # (n_act,)
+        fb_act   = fb[:, self.active]         # (T, n_act)
 
-        # SoC_min rows (0..T-1):
-        #   sum_{s<t} p_dis[s]/eta_dis - p_ch[s]*eta_ch <= SoC_0 - SoC_min
-        A_min = np.hstack([L / self.eta_dis, -L * self.eta_ch])   # (T, 2T)
+        # Headroom numerators for each line l and each direction:
+        #   upper_num[t,l] = f_lim[l] - fb_act[t,l]   (slack before upper limit)
+        #   lower_num[t,l] = f_lim[l] + fb_act[t,l]   (slack before lower limit)
+        upper_num = f_lim[np.newaxis, :] - fb_act   # (T, n_act)
+        lower_num = f_lim[np.newaxis, :] + fb_act   # (T, n_act)
 
-        # SoC_max rows (T..2T-1):
-        #  -sum_{s<t} p_dis[s]/eta_dis + p_ch[s]*eta_ch <= SoC_max - SoC_0
-        A_max = np.hstack([-L / self.eta_dis, L * self.eta_ch])   # (T, 2T)
+        # Per-line per-timestep bounds on p_net:
+        #   ptdf > 0: upper p_net = upper_num / ptdf,  lower p_net = -lower_num / ptdf
+        #   ptdf < 0: upper p_net = lower_num / (-ptdf), lower p_net = -upper_num / (-ptdf)
+        p_hi = np.full(T, self.P_max)
+        p_lo = np.full(T, -self.P_max)
 
-        self.A_ub = np.vstack([A_min, A_max])                      # (2T, 2T)
-        self.b_ub = np.concatenate([
-            np.full(T, self.SoC_0 - self.SoC_min),
-            np.full(T, self.SoC_max - self.SoC_0),
-        ])
+        pos = ptdf_act > 0
+        neg = ~pos
 
-    def solve(self, lmps_episode: np.ndarray):
-        """
-        Solve the LP for a given episode LMP sequence.
+        if pos.any():
+            # upper bound from pos lines (smallest positive slack / ptdf)
+            p_hi = np.minimum(p_hi, (upper_num[:, pos] / ptdf_act[pos]).min(axis=1))
+            # lower bound from pos lines (largest of -lower_num / ptdf)
+            p_lo = np.maximum(p_lo, (-lower_num[:, pos] / ptdf_act[pos]).max(axis=1))
 
-        Parameters
-        ----------
-        lmps_episode : np.ndarray, shape (T,)  [$/MWh]
+        if neg.any():
+            # For negative ptdf: dividing by a negative flips the bound direction.
+            # Upper bound on p_net: -lower_num / ptdf = lower_num / |ptdf|
+            p_hi = np.minimum(p_hi, (lower_num[:, neg] / (-ptdf_act[neg])).min(axis=1))
+            # Lower bound on p_net: -upper_num / ptdf = upper_num / |ptdf|
+            p_lo = np.maximum(p_lo, (-upper_num[:, neg] / (-ptdf_act[neg])).max(axis=1))
 
-        Returns
-        -------
-        profit : float  -- maximum episode profit [$]
-        p_dis  : np.ndarray (T,)  -- optimal discharge schedule [MW]
-        p_ch   : np.ndarray (T,)  -- optimal charge schedule [MW]
-        Returns (0, zeros, zeros) if LP is infeasible.
-        """
-        T    = self.T
+        # Clip to physical power rating
+        p_hi = np.clip(p_hi, -self.P_max, self.P_max)
+        p_lo = np.clip(p_lo, -self.P_max, self.P_max)
+
+        # Pad to T if f_base_episode was shorter
+        if T < self.T:
+            p_hi = np.concatenate([p_hi, np.full(self.T - T, self.P_max)])
+            p_lo = np.concatenate([p_lo, np.full(self.T - T, -self.P_max)])
+
+        return p_hi, p_lo
+
+    def solve(
+        self,
+        lmps_episode: np.ndarray,
+        f_base_episode: np.ndarray | None = None,
+        soc_init: float | None = None,
+    ):
+        """Solve the episode LP and return profit plus aggregate charge/discharge."""
+        from scipy.sparse import vstack as _sp_vstack
+
+        T, J = self.T, self.J
         lmps = np.asarray(lmps_episode[:T], dtype=np.float64)
 
-        # Objective: minimise -profit
-        #   c_dis[t] - lmp[t]  for discharge variables
-        #   lmp[t]              for charge variables
-        c_obj = np.concatenate([self.c_dis - lmps, lmps])
+        # ------------------------------------------------------------------
+        # Episode-specific equality RHS: update t=0 energy-balance rows
+        # if the episode starts from a different SoC than SOC_INIT.
+        # ------------------------------------------------------------------
+        if soc_init is not None:
+            e0_ep = self._initial_seg_energies(float(soc_init))
+            b_eq = self._b_eq.copy()
+            b_eq[:J] = e0_ep   # only t=0 rows (indices 0..J-1) differ
+        else:
+            b_eq = self._b_eq
 
-        bounds = [(0.0, self.P_max)] * (2 * T)
+        # ------------------------------------------------------------------
+        # Episode-dependent objective.
+        # p_dis[t,j]: (c_j/η_dis − λ_t) — profitable when λ_t > c_j/η_dis.
+        # p_ch[t,j]:  λ_t               — charging costs the spot price.
+        # e[t,j]:     0                  — no direct cost on stored energy.
+        # ------------------------------------------------------------------
+        c_dis = np.array(
+            [(self.c_j[j] / self.eta_dis) - lmps[t]
+             for t in range(T) for j in range(J)],
+            dtype=np.float64,
+        )
+        c_ch = np.array(
+            [lmps[t] for t in range(T) for j in range(J)],
+            dtype=np.float64,
+        )
+        c_obj = np.concatenate([c_dis, c_ch, np.zeros(T * J)])
+
+        # ------------------------------------------------------------------
+        # PTDF network constraints (episode-specific RHS only).
+        # A_ptdf is pre-built in __init__; only b_ptdf changes per episode.
+        # ------------------------------------------------------------------
+        if f_base_episode is not None:
+            p_hi_ptdf, p_lo_ptdf = self._ptdf_bounds_episode(f_base_episode)
+            # Inequality rows:
+            #   rows 0..T-1:   p_net ≤ p_hi_ptdf  →  b = p_hi_ptdf
+            #   rows T..2T-1: −p_net ≤ −p_lo_ptdf →  b = −p_lo_ptdf
+            b_ptdf = np.concatenate([p_hi_ptdf, -p_lo_ptdf])
+            A_ub_full = _sp_vstack([self._A_ub, self._A_ptdf], format="csr")
+            b_ub_full = np.concatenate([self._b_ub, b_ptdf])
+        else:
+            A_ub_full = self._A_ub
+            b_ub_full = self._b_ub
 
         result = linprog(
             c=c_obj,
-            A_ub=self.A_ub,
-            b_ub=self.b_ub,
-            bounds=bounds,
+            A_ub=A_ub_full,
+            b_ub=b_ub_full,
+            A_eq=self._A_eq,
+            b_eq=b_eq,
+            bounds=self._lp_bounds,
             method="highs",
         )
 
         if result.status == 0:
-            p_dis  = result.x[:T]
-            p_ch   = result.x[T:]
-            profit = -float(result.fun)   # negate: linprog minimised -profit
+            p_dis_seg = result.x[:T * J].reshape(T, J)
+            p_ch_seg  = result.x[T * J: 2 * T * J].reshape(T, J)
+            p_dis  = p_dis_seg.sum(axis=1)   # aggregate [MW, delivered to grid]
+            p_ch   = p_ch_seg.sum(axis=1)    # aggregate [MW, drawn from grid]
+            profit = -float(result.fun)       # linprog minimised −profit
             return profit, p_dis, p_ch
         else:
             return 0.0, np.zeros(T), np.zeros(T)
@@ -1225,13 +1024,7 @@ def _commit_nstep_transition_from_window(
     n_step: int,
     gamma: float,
 ) -> bool:
-    """
-    Commit the oldest transition from the rolling 1-step window.
-
-    Uses full N-step horizon when available (len >= n_step+1).  During episode-tail
-    flush (len < n_step+1), commits the remaining partial horizon with done_n=True
-    whenever terminal is observed in the used reward slice.
-    """
+    """Commit the oldest transition from the rolling N-step window."""
     if len(window) == 0:
         return False
 
@@ -1276,35 +1069,7 @@ def run_episode_collect(
     n_step: int   = 1,
     gamma:  float = 0.99,
 ) -> tuple:
-    """
-    Run one episode with the stochastic SAC policy, storing N-step transitions.
-
-    For n_step > 1 the buffer receives aggregated transitions:
-      (s_t, a_t, G_t^N, s_{t+N}, done_N, bounds_t)
-    where:
-      G_t^N    = sum_{k=0}^{N-1} gamma^k * r_{t+k}   (N-step discounted return)
-      s_{t+N}  = observation N steps after s_t
-      done_N   = True if the episode ended within the N-step window
-                 (suppresses bootstrapping from s_{t+N})
-      bounds_t = safety-layer feasibility interval [p_lo, p_hi] at state s_t,
-                 used in the Convention-B actor update at s_t (unchanged).
-
-    Episode tails are flushed after termination, so no transitions are dropped.
-
-    Parameters
-    ----------
-    agent  : SACAgent
-    env    : BESSEnv
-    buffer : ReplayBuffer  (modified in-place)
-    n_step : int    -- N-step horizon (from HP["n_step"])
-    gamma  : float  -- discount factor (from HP["gamma"])
-
-    Returns
-    -------
-    ep_return : float  -- total (scaled) episode return (sum of raw 1-step rewards)
-    ep_infos  : list   -- list of info dicts from env.step()
-    n_added   : int    -- number of transitions pushed to replay buffer
-    """
+    """Collect one rollout and store N-step transitions in replay."""
     obs, _    = env.reset()
     ep_return = 0.0
     ep_infos  = []
@@ -1314,8 +1079,10 @@ def run_episode_collect(
     window = deque()
 
     for _ in range(env.EPS_LEN):
-        act = agent.act(obs, deterministic=False)   # shape (1,) in [-1, 1]
-        act = np.clip(act, -1.0, 1.0)              # guard against tanh float overflow
+        act = agent.act(obs, deterministic=False)   # shape (1,) in [p_lo_norm, p_hi_norm]
+        # No external clip needed: bounded-tanh actor already outputs in [p_lo, p_hi].
+        # The env's safety layer will further project (redundantly but harmlessly).
+        act = np.clip(act, -1.0, 1.0)              # float32 overflow guard only
         next_obs, rew, terminated, truncated, info = env.step(act)
         done = terminated or truncated
 
@@ -1356,60 +1123,24 @@ def lp_warmstart(
     gamma:     float = 0.99,
 ) -> int:
     """
-    Pre-fill the replay buffer with LP-optimal expert trajectories.
+    Pre-fill the replay buffer with PTDF-feasible LP trajectories.
 
-    Motivation (Rasic et al. 2025, RLBattEM4):
-      Without expert guidance the agent often converges to a trivial
-      discharge-only policy and fails to discover long-term arbitrage
-      (observed in run-7 cold-start failure). Filling 62.5% of the
-      initial batch with LP-optimal trajectories exposes the critic to
-      high-quality (s,a,r,s') pairs from episode 1, anchoring the
-      Q-estimates in profitable operating regions before SAC exploration
-      begins. The expert data is gradually diluted as the 200k buffer
-      fills, preventing it from dominating later training.
-
-    Implementation:
-      1. Reset env to a random training start.
-      2. Read episode LMPs directly from env.lmps (no env modification needed).
-      3. Solve PerfectForesightLP for the optimal p_dis, p_ch schedule.
-      4. Replay the LP schedule step-by-step through the REAL env.step():
-           - Safety layer projects actions to PTDF-feasible set (LP is single-bus).
-           - Actual rewards, SoC dynamics, and bounds are recorded.
-      5. Use the same N+1 sliding window as run_episode_collect to build
-         N-step transitions, ensuring expert data is in the exact same format
-         as SAC-collected data (gamma^N bootstrap, next_bounds stored).
-
-    Parameters
-    ----------
-    env       : BESSEnv               -- environment (training mode expected)
-    buffer    : ReplayBuffer           -- buffer to fill in-place
-    lp_oracle : PerfectForesightLP     -- pre-built LP oracle
-    n_target  : int                    -- number of transitions to add
-    n_step    : int                    -- N-step horizon (match HP["n_step"])
-    gamma     : float                  -- discount factor (match HP["gamma"])
-
-    Returns
-    -------
-    int  -- actual number of transitions added (may be < n_target if
-            episode boundaries are reached before n_target)
+    LP warm-start always stores 1-step transitions, even if online SAC uses a
+    larger N-step horizon.
     """
+    _lp_nstep = 1   # always 1; do not change to hp["n_step"]
     n_added = 0
 
     while n_added < n_target:
-        # Reset to a random training start
-        obs, _ = env.reset()
+        obs, _ = env.reset()   # randomises SoC in training mode
 
-        # Extract episode LMPs from the data array (no env modification needed)
         start_t    = env.global_t
+        soc_start  = env.soc                                          # randomised SoC [MWh]
         lmps_ep    = env.lmps[start_t : start_t + env.EPS_LEN, env.bess_col]
-
-        # Solve LP for the optimal schedule
-        _, p_dis, p_ch = lp_oracle.solve(lmps_ep)
-
-        # Convert to normalised [-1, 1] action: positive = discharge
+        f_base_ep  = env.line_flows[start_t : start_t + env.EPS_LEN] # (T, 120)
+        _, p_dis, p_ch = lp_oracle.solve(lmps_ep, f_base_ep, soc_init=soc_start)
         actions_lp = np.clip((p_dis - p_ch) / env.P_MAX, -1.0, 1.0).astype(np.float32)
 
-        # Replay through real env with N+1 look-ahead window
         window = deque()
 
         for t in range(env.EPS_LEN):
@@ -1424,135 +1155,178 @@ def lp_warmstart(
             window.append((obs, act_proj, float(rew), next_obs, done,
                            p_lo_norm, p_hi_norm))
 
-            while len(window) >= n_step + 1 and n_added < n_target:
-                _commit_nstep_transition_from_window(window, buffer, n_step, gamma)
+            while len(window) >= _lp_nstep + 1 and n_added < n_target:
+                _commit_nstep_transition_from_window(window, buffer, _lp_nstep, gamma)
                 n_added += 1
 
             obs = next_obs
-            if done:
+            if done or n_added >= n_target:
                 break
 
-            if n_added >= n_target:
-                break
-
-        # Tail flush for this episode
         while len(window) > 0 and n_added < n_target:
-            _commit_nstep_transition_from_window(window, buffer, n_step, gamma)
+            _commit_nstep_transition_from_window(window, buffer, _lp_nstep, gamma)
             n_added += 1
 
     return n_added
 
 
-def warmstart_actor_bc(
-    agent: SACAgent,
+def _sample_bc_batch(
     buffer: ReplayBuffer,
-    n_expert: int,
-    n_steps: int,
     batch_size: int,
-) -> dict:
+    active_threshold: float,
+    active_frac: float,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Behavior-clone actor on the expert prefix already stored in replay buffer.
+    Sample a behavior-cloning batch with explicit emphasis on active LP actions.
 
-    Assumes warm-start ran on an empty buffer, so indices [0, n_expert) are
-    LP expert transitions.
+    The replay is dominated by idle LP actions, so uniform BC mostly teaches
+    "do nothing". This sampler forces a configurable share of the batch to come
+    from charge/discharge steps while still keeping some idle context.
     """
-    n_expert = int(min(n_expert, len(buffer)))
-    n_steps = int(max(0, n_steps))
-    if n_expert <= 0 or n_steps == 0:
-        return {"n_steps": 0, "loss_init": np.nan, "loss_final": np.nan, "loss_mean": np.nan}
+    size = len(buffer)
+    if size == 0:
+        raise ValueError("Cannot sample BC batch from an empty replay buffer.")
 
-    bsz = int(max(1, min(batch_size, n_expert)))
-    losses = []
-    for _ in range(n_steps):
-        idx = np.random.randint(0, n_expert, size=bsz)
-        obs_tf = tf.convert_to_tensor(buffer.obs[idx], dtype=tf.float32)
-        act_tf = tf.convert_to_tensor(buffer.act[idx], dtype=tf.float32)
-        loss = agent._bc_actor_step(obs_tf, act_tf)
-        losses.append(float(loss))
+    idx_all = np.arange(size, dtype=np.int64)
+    act_abs = np.abs(buffer.act[:size, 0])
+    active_idx = idx_all[act_abs > active_threshold]
+    idle_idx   = idx_all[act_abs <= active_threshold]
 
-    return {
-        "n_steps": n_steps,
-        "loss_init": float(losses[0]),
-        "loss_final": float(losses[-1]),
-        "loss_mean": float(np.mean(losses)),
-    }
+    if len(active_idx) == 0 or len(idle_idx) == 0:
+        chosen = np.random.choice(idx_all, size=batch_size, replace=size < batch_size)
+        return buffer.obs[chosen], buffer.act[chosen]
+
+    n_active = int(round(batch_size * active_frac))
+    n_active = max(1, min(batch_size - 1, n_active))
+    n_idle   = batch_size - n_active
+
+    chosen_active = np.random.choice(
+        active_idx, size=n_active, replace=len(active_idx) < n_active
+    )
+    chosen_idle = np.random.choice(
+        idle_idx, size=n_idle, replace=len(idle_idx) < n_idle
+    )
+    chosen = np.concatenate([chosen_active, chosen_idle])
+    np.random.shuffle(chosen)
+    return buffer.obs[chosen], buffer.act[chosen]
 
 
 def _run_evaluation(
     agent: SACAgent,
     env:   BESSEnv,
 ) -> dict:
-    """
-    Evaluate the agent deterministically (no exploration noise) on every
-    held-out test start exactly once.
+    """Run deterministic evaluation on every held-out test start."""
+    returns     = []
+    soc_ends    = []
+    soc_mins    = []
+    revenues    = []
+    deg_costs   = []
+    n_discharge = []
+    n_charge    = []
+    n_idle      = []
 
-    Iterates over all env.test_starts (final week of each calendar month,
-    ~95 episodes) using reset(options={"start_t": t}) to set the exact
-    episode start.  This gives a reproducible, full-coverage test evaluation
-    without random sampling variance.
-
-    Parameters
-    ----------
-    agent : SACAgent
-    env   : BESSEnv
-
-    Returns
-    -------
-    dict with keys: eval_mean, eval_std, eval_min, eval_max, n_eval
-    """
-    returns = []
     for start_t in env.test_starts:
         obs, _    = env.reset(options={"start_t": int(start_t)})
         ep_return = 0.0
+        ep_rev    = 0.0
+        ep_deg    = 0.0
+        ep_n_dis  = 0
+        ep_n_ch   = 0
+        ep_n_idle = 0
+        ep_soc_min = env.soc
 
         for _ in range(env.EPS_LEN):
             act = np.clip(agent.act(obs, deterministic=True), -1.0, 1.0)
-            obs, rew, terminated, truncated, _ = env.step(act)
-            ep_return += rew
+            obs, rew, terminated, truncated, info = env.step(act)
+            ep_return  += rew
+            ep_rev     += info["revenue_$"]
+            ep_deg     += info["deg_cost_$"]
+            p_safe      = info["p_safe_mw"]
+            ep_soc_min  = min(ep_soc_min, info["soc_mwh"])
+            if p_safe > 0.5:
+                ep_n_dis  += 1
+            elif p_safe < -0.5:
+                ep_n_ch   += 1
+            else:
+                ep_n_idle += 1
             if terminated or truncated:
                 break
 
         returns.append(ep_return)
+        soc_ends.append(info["soc_mwh"])
+        soc_mins.append(ep_soc_min)
+        revenues.append(ep_rev)
+        deg_costs.append(ep_deg)
+        n_discharge.append(ep_n_dis)
+        n_charge.append(ep_n_ch)
+        n_idle.append(ep_n_idle)
 
-    returns = np.array(returns)
+    returns     = np.array(returns)
+    total_steps = np.array(n_discharge) + np.array(n_charge) + np.array(n_idle)
     return {
-        "eval_mean": float(np.mean(returns)),
-        "eval_std":  float(np.std(returns)),
-        "eval_min":  float(np.min(returns)),
-        "eval_max":  float(np.max(returns)),
-        "n_eval":    len(returns),
+        "eval_mean":      float(np.mean(returns)),
+        "eval_std":       float(np.std(returns)),
+        "eval_min":       float(np.min(returns)),
+        "eval_max":       float(np.max(returns)),
+        "n_eval":         len(returns),
+        "soc_end_mean":   float(np.mean(soc_ends)),
+        "soc_min_mean":   float(np.mean(soc_mins)),
+        "revenue_mean":   float(np.mean(revenues)),
+        "deg_cost_mean":  float(np.mean(deg_costs)),
+        "profit_mean":    float(np.mean(np.array(revenues) - np.array(deg_costs))),
+        "frac_discharge": float(np.mean(np.array(n_discharge) / np.maximum(total_steps, 1))),
+        "frac_charge":    float(np.mean(np.array(n_charge)    / np.maximum(total_steps, 1))),
+        "frac_idle":      float(np.mean(np.array(n_idle)      / np.maximum(total_steps, 1))),
+    }
+
+
+def _run_oracle_evaluation(env: BESSEnv) -> dict:
+    """Evaluate the perfect-foresight LP on the held-out test starts."""
+    oracle = PerfectForesightLP(env)
+    returns = []
+    profits = []
+
+    for start_t in env.test_starts:
+        lmps_ep    = env.lmps[start_t:start_t + env.EPS_LEN, env.bess_col]
+        flows_ep   = env.line_flows[start_t:start_t + env.EPS_LEN]
+        _, p_dis, p_ch = oracle.solve(lmps_ep, flows_ep, env.SOC_INIT)
+        actions_lp = np.clip((p_dis - p_ch) / env.P_MAX, -1.0, 1.0).astype(np.float32)
+
+        obs, _ = env.reset(options={"start_t": int(start_t)})
+        ep_return = 0.0
+        ep_profit = 0.0
+
+        for a in actions_lp:
+            obs, rew, terminated, truncated, info = env.step(
+                np.array([a], dtype=np.float32)
+            )
+            ep_return += rew
+            ep_profit += info["reward_raw_$"]
+            if terminated or truncated:
+                break
+
+        returns.append(ep_return)
+        profits.append(ep_profit)
+
+    return {
+        "oracle_eval_mean":   float(np.mean(returns)),
+        "oracle_eval_std":    float(np.std(returns)),
+        "oracle_profit_mean": float(np.mean(profits)),
+        "n_eval":             len(returns),
     }
 
 
 def train_sac(env: BESSEnv, hp: dict) -> tuple:
-    """
-    Full SAC training pipeline.
-
-    SAC Training
-    ~~~~~~~~~~~~
-    For each episode:
-      1. Collect one episode with the stochastic policy.
-      2. Perform env.EPS_LEN (=168) gradient updates from the buffer.
-      3. Every hp['eval_freq'] episodes: evaluate on ALL test starts + checkpoint.
-
-    Parameters
-    ----------
-    env : BESSEnv    -- instantiated environment
-    hp  : dict       -- hyperparameter dict
-
-    Returns
-    -------
-    agent : SACAgent  -- trained agent
-    log   : dict      -- training metrics
-    """
+    """Train SAC with LP warm-start, periodic evaluation, and checkpointing."""
     seed = hp["seed"]
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
-    obs_dim = env.observation_space.shape[0]   # 34 (SoC+LMP+hist24+PV+step+segs4+p_lo+p_hi)
+    obs_dim = env.observation_space.shape[0]   # 38 (SoC+LMP+hist24+PV+step+segs4+p_lo+p_hi+sin_dow+cos_dow+load+wind)
     act_dim = env.action_space.shape[0]        # 1
 
-    buffer = ReplayBuffer(obs_dim, act_dim, hp["buffer_size"])
+    buffer = ReplayBuffer(obs_dim, act_dim, hp["buffer_size"],
+                          per_alpha=hp.get("per_alpha", 0.0))
     agent  = SACAgent(obs_dim, act_dim, hp)
 
     print(f"\nSAC Agent created:")
@@ -1565,23 +1339,30 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
     print(f"  init_alpha:    {hp.get('init_alpha', 0.01):.4f}")
     print(f"  alpha_lr:      {hp.get('alpha_lr', hp['lr']):.1e}")
     print(f"  target_entropy = {float(agent.target_entropy):.2f}")
+    print(f"  proj_lambda:   {hp.get('proj_lambda', 0.0):.3f}")
     print(f"  lp_warmstart:  {hp.get('lp_warmstart_steps', 0)} transitions "
           f"({hp.get('lp_warmstart_steps', 0) / hp['buffer_size'] * 100:.1f}% "
-          f"of total buffer capacity)")
-    print(f"  warmstart BC:  {hp.get('warmstart_bc_steps', 0)} steps "
-          f"(batch={hp.get('warmstart_bc_batch_size', hp['batch_size'])})")
+          f"of total buffer capacity, n_step=1 forced)")
+    print(f"  lp_bc_steps:   {hp.get('lp_bc_steps', 0)}")
 
     # ---- LP Expert Warm-Start ----
     _ws_steps = hp.get("lp_warmstart_steps", 0)
+    _bc_threshold = float(hp.get("lp_bc_active_threshold", 0.02))
+    _bc_active_frac = float(hp.get("lp_bc_active_frac", 0.75))
+
     if _ws_steps > 0:
         print(f"\n{'='*65}")
         print(f"LP Expert Warm-Start (target: {_ws_steps} transitions)")
         print(f"{'='*65}")
         _lp_oracle = PerfectForesightLP(env)
-        print(f"  Oracle economics check: LMP_max={_lp_oracle.lmp_max:.2f} $/MWh, "
-              f"deepest profitable segment={_lp_oracle.deepest_profitable_seg}")
+        _lmp_max = float(np.max(env.lmps[env.converged, env.bess_col]))
+        _breakevens = _lp_oracle.c_j / _lp_oracle.eta_dis
+        _n_profitable = int(np.sum(_lmp_max >= _breakevens))
+        print(f"  Oracle economics check: LMP_max={_lmp_max:.2f} $/MWh, "
+              f"profitable segments={_n_profitable}/{_lp_oracle.J} "
+              f"(breakevens: {', '.join(f'${b:.2f}' for b in _breakevens)})")
         print(f"  Oracle SoC band: [{_lp_oracle.SoC_min:.1f}, {_lp_oracle.SoC_max:.1f}] MWh, "
-              f"c_dis≈{_lp_oracle.c_dis:.2f} $/MWh delivered")
+              f"e0={[f'{e:.1f}' for e in _lp_oracle.e0]} MWh per segment")
         _t_ws = time.time()
         n_ws = lp_warmstart(
             env, buffer, _lp_oracle,
@@ -1591,30 +1372,67 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
         )
         print(f"  Added {n_ws} LP transitions in {time.time()-_t_ws:.1f}s  "
               f"(buffer fill: {len(buffer)}/{hp['buffer_size']})")
-        _bc_steps = int(hp.get("warmstart_bc_steps", 0))
-        if _bc_steps > 0 and n_ws > 0:
-            _t_bc = time.time()
-            _bc = warmstart_actor_bc(
-                agent=agent,
-                buffer=buffer,
-                n_expert=n_ws,
-                n_steps=_bc_steps,
-                batch_size=int(hp.get("warmstart_bc_batch_size", hp["batch_size"])),
+        _lp_actions = buffer.act[:n_ws, 0]
+        _lp_dis = float(np.mean(_lp_actions >  _bc_threshold))
+        _lp_ch  = float(np.mean(_lp_actions < -_bc_threshold))
+        _lp_idle = float(np.mean(np.abs(_lp_actions) <= _bc_threshold))
+        print(f"  LP replay mix: dis={_lp_dis*100:.1f}%  "
+              f"ch={_lp_ch*100:.1f}%  idle={_lp_idle*100:.1f}%")
+
+    # ---- LP Actor BC Pre-Training ----
+    # Pretrain the actor on stored LP actions before SAC updates begin.
+    _bc_steps = hp.get("lp_bc_steps", 0)
+    if _bc_steps > 0 and len(buffer) >= hp["batch_size"]:
+        print(f"\n{'='*65}")
+        print(f"LP Actor BC Pre-Training ({_bc_steps} steps, batch={hp['batch_size']})")
+        print(f"{'='*65}")
+        _bc_t = time.time()
+        _bc_losses = []
+        for _s in range(_bc_steps):
+            _obs_np, _act_np = _sample_bc_batch(
+                buffer,
+                hp["batch_size"],
+                active_threshold=_bc_threshold,
+                active_frac=_bc_active_frac,
             )
-            print(
-                "  Actor BC pretrain: "
-                f"steps={_bc['n_steps']}, "
-                f"loss { _bc['loss_init']:.4f} -> { _bc['loss_final']:.4f} "
-                f"(mean={_bc['loss_mean']:.4f}) in {time.time()-_t_bc:.1f}s"
-            )
+            _obs_b   = tf.constant(_obs_np, dtype=tf.float32)  # (batch, obs_dim)
+            _act_lp  = tf.constant(_act_np, dtype=tf.float32)  # (batch, 1) LP action
+            with tf.GradientTape() as _tape:
+                # Clone the deterministic policy mean.
+                _act_pred = agent.actor.get_deterministic_action(_obs_b)  # (batch, 1)
+                # Slightly upweight active LP transitions on top of stratified sampling.
+                _active_w = 1.0 + 4.0 * tf.cast(tf.abs(_act_lp) > _bc_threshold, tf.float32)
+                _bc_loss  = tf.reduce_mean(_active_w * (_act_pred - _act_lp) ** 2)
+            _grads = _tape.gradient(_bc_loss, agent.actor.trainable_variables)
+            _grads_and_vars = [
+                (_g, _v)
+                for _g, _v in zip(_grads, agent.actor.trainable_variables)
+                if _g is not None
+            ]
+            agent.actor_opt.apply_gradients(_grads_and_vars)
+            _bc_losses.append(float(_bc_loss))
+        print(f"  BC done in {time.time()-_bc_t:.1f}s: "
+              f"loss {_bc_losses[0]:.4f} → {_bc_losses[-1]:.4f}  "
+              f"(mean last 100: {float(np.mean(_bc_losses[-100:])):.4f})")
+        print(f"  BC sampler mix: target active share={_bc_active_frac*100:.0f}% "
+              f"above |a|>{_bc_threshold:.2f}")
 
     # ---- SAC training ----
     print(f"\n{'='*65}")
     print(f"SAC Training ({hp['train_episodes']} episodes)")
     print(f"{'='*65}")
 
-    checkpoint_dir = os.path.join(OUTPUTS_DIR, "step4_checkpoints")
+    oracle_eval = _run_oracle_evaluation(env)
+    print(f"  Held-out LP oracle: eval={oracle_eval['oracle_eval_mean']:+.4f}±"
+          f"{oracle_eval['oracle_eval_std']:.4f} | "
+          f"profit=${oracle_eval['oracle_profit_mean']:.0f}")
+
+    # Give each run its own output directory.
+    _run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir        = os.path.join(OUTPUTS_DIR, "runs", _run_id)
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"  Run directory: {run_dir}")
 
     log = {
         "train_returns":   [],
@@ -1622,8 +1440,11 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
         "actor_losses":    [],
         "alpha_values":    [],
         "proj_penalties":  [],   # ||a_raw - a_proj||^2; trends → 0 as actor learns feasibility
-        "eval_returns":    [],   # list of dicts: {episode, eval_mean, eval_std, ...}
+        "eval_returns":    [],   # list of dicts: {episode, eval_mean, eval_std, diagnostics…}
         "episodes":        [],
+        "run_id":          _run_id,
+        "hp":              hp,
+        "oracle_eval":     oracle_eval,
     }
 
     # Early-stopping state
@@ -1645,13 +1466,10 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
             gamma=hp["gamma"],
         )
 
-        # 2a. Anneal PER IS exponent β: 0.4 → 1.0 over full training run.
-        #     Early training: β low → biased-but-stable gradients.
-        #     Late training: β → 1 → fully unbiased IS correction (Schaul 2016 §3.4).
+        # Anneal the PER importance-sampling exponent.
         buffer.anneal_beta(ep / hp["train_episodes"])
 
-        # 2b. Gradient updates (one per collected transition, once the
-        #     buffer has enough diverse transitions to form stable TD targets)
+        # One gradient step per collected transition after warm-up.
         _min_fill = hp.get("min_buffer_fill", hp["batch_size"])
         c_losses, a_losses, alphas, proj_pens = [], [], [], []
         for _ in range(n_collected):
@@ -1675,8 +1493,7 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
             eval_m = _run_evaluation(agent, env)
             log["eval_returns"].append({"episode": ep, **eval_m})
 
-            # --- Checkpoint: save whenever this is the all-time best eval ---
-            # Decoupled from patience so we never miss the true global maximum.
+            # Save the all-time best checkpoint separately from patience logic.
             if eval_m["eval_mean"] > best_eval:
                 best_eval = eval_m["eval_mean"]
                 best_ep   = ep
@@ -1687,9 +1504,7 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
             else:
                 tag = ""
 
-            # --- Patience: only reset when improvement exceeds min_delta ---
-            # This prevents micro-improvements (noise) from resetting patience
-            # indefinitely while still detecting genuine slow progress.
+            # Reset patience only on a material improvement.
             if eval_m["eval_mean"] > best_eval_patience + min_delta:
                 best_eval_patience = eval_m["eval_mean"]
                 no_improve = 0
@@ -1697,18 +1512,32 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
                 no_improve += 1
                 tag += f" (no improve {no_improve}/{patience})"
 
-            # Always save periodic checkpoint for later analysis
+            # Save the periodic checkpoint for later inspection.
             ckpt_path = os.path.join(checkpoint_dir, f"ep{ep:04d}", "agent")
             os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
             agent.save(ckpt_path)
 
+            # Incremental log save.
+            _log_path = os.path.join(run_dir, "training_log.npy")
+            np.save(_log_path, log, allow_pickle=True)
+
             elapsed = time.time() - t_train_start
+            _oracle_mean = oracle_eval["oracle_eval_mean"]
+            _oracle_capture = (
+                eval_m["eval_mean"] / _oracle_mean if _oracle_mean > 1e-8 else np.nan
+            )
             print(
                 f"  Ep {ep:4d}/{hp['train_episodes']} | "
                 f"train_ret={ep_return:+.4f} | "
                 f"eval={eval_m['eval_mean']:+.4f}±{eval_m['eval_std']:.4f} | "
+                f"oracle={_oracle_mean:+.4f} cap={_oracle_capture*100:.1f}% | "
                 f"alpha={log['alpha_values'][-1]:.4f} | "
                 f"critic_loss={log['critic_losses'][-1]:.4f} | "
+                f"SoC={eval_m['soc_end_mean']:.1f}/{eval_m['soc_min_mean']:.1f}MWh | "
+                f"profit=${eval_m['profit_mean']:.0f} "
+                f"(rev=${eval_m['revenue_mean']:.0f} deg=${eval_m['deg_cost_mean']:.0f}) | "
+                f"dis={eval_m['frac_discharge']:.0%} ch={eval_m['frac_charge']:.0%} "
+                f"idle={eval_m['frac_idle']:.0%} | "
                 f"{elapsed:.0f}s{tag}"
             )
 
@@ -1728,10 +1557,13 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
                 f"{elapsed:.0f}s"
             )
 
-    # ---- Save training log ----
-    log_path = os.path.join(OUTPUTS_DIR, "step4_training_log.npy")
+    # ---- Save final training log ----
+    log_path = os.path.join(run_dir, "training_log.npy")
     np.save(log_path, log, allow_pickle=True)
     print(f"\nTraining log saved -> {log_path}")
+    # Keep the legacy log path for downstream scripts.
+    legacy_path = os.path.join(OUTPUTS_DIR, "step4_training_log.npy")
+    np.save(legacy_path, log, allow_pickle=True)
 
     return agent, log
 
@@ -1746,11 +1578,7 @@ def print_results_summary(
     env:   BESSEnv,
     hp:    dict,
 ) -> None:
-    """
-    Print a comprehensive post-training results table:
-      - Training return statistics (full run + final 100 eps)
-      - Evaluation return statistics on all test starts
-    """
+    """Print a compact training and evaluation summary."""
     print("\n" + "=" * 65)
     print("NC-SafeRL  STEP 4  RESULTS SUMMARY")
     print("=" * 65)
@@ -1776,6 +1604,11 @@ def print_results_summary(
         print(f"  Final eval min/max      : "
               f"{log['eval_returns'][-1]['eval_min']:+.4f} / "
               f"{log['eval_returns'][-1]['eval_max']:+.4f}")
+        if "oracle_eval" in log:
+            oracle_mean = log["oracle_eval"]["oracle_eval_mean"]
+            best_capture = eval_means[best_idx] / oracle_mean if oracle_mean > 1e-8 else np.nan
+            print(f"  Oracle eval mean return : {oracle_mean:+.4f}")
+            print(f"  Best oracle capture     : {best_capture*100:.1f}%")
 
     print("=" * 65)
 
@@ -1785,47 +1618,24 @@ def print_results_summary(
 # ================================================================
 
 def main() -> None:
-    """
-    Entry point: instantiate environment, train SAC, print summary.
-
-    Usage:
-        python 4.SACAgent.py
-    """
+    """Instantiate the environment, train SAC, and export the best checkpoint."""
     # Ensure outputs directory exists
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
     print("\n" + "=" * 65)
     print("NC-SafeRL  STEP 4: SAC Agent Training")
-    print("RTS-GMLC 73-bus | BESS bus 111 | TF 2.x CPU")
     print("=" * 65)
 
     # ---- Create environment ----
     env = BESSEnv(seed=HP["seed"])
+    _device_tag = "Metal GPU" if tf.config.get_visible_devices("GPU") else "CPU"
+    print(f"RTS-GMLC 73-bus | BESS bus {env.bess_bus_rts} | TF 2.x {_device_tag}")
 
-    # ---- E0: PTDF Binding Pre-Training Diagnostic ----
-    # Validates that transmission constraints actively limit BESS dispatch at
-    # this bus, justifying the NC safety layer over battery-only projection.
-    # If PTDF constraints bind < 5% of hours, the ablation gap will be tiny.
-    # Run once before training; results saved to outputs/ptdf_binding_stats.npy.
+    # ---- E0: PTDF binding diagnostic ----
     ptdf_binding_analysis(env, save_dir=OUTPUTS_DIR)
 
     # ---- Train ----
-    # CONVERGENCE MONITORING NOTE
-    # ----------------------------
-    # Training episode returns are intentionally NOISY: each episode is sampled
-    # from a random training week, and weeks differ significantly in LMP level
-    # (e.g., winter peak $140/MWh vs. summer shoulder $35/MWh). A rolling mean
-    # of training returns (see log["train_returns"]) is useful for stability
-    # monitoring but is NOT the convergence criterion.
-    #
-    # The convergence plot for the paper is: eval_mean vs. episode.
-    # _run_evaluation() evaluates the DETERMINISTIC policy on ALL ~95 held-out
-    # test weeks every eval_freq=100 episodes. Averaging over all test starts
-    # eliminates week-selection variance, giving a stable, reproducible signal.
-    # Early stopping triggers after `early_stop_patience` consecutive evals
-    # (= patience * eval_freq episodes) without min_delta improvement.
-    #
-    # Best checkpoint = argmax(eval_mean) — loaded from outputs/step4_checkpoints/best/
+    # Use held-out deterministic evaluation, not noisy train returns, for model selection.
     t0 = time.time()
     agent, log = train_sac(env, HP)
     total_time = time.time() - t0
@@ -1835,8 +1645,9 @@ def main() -> None:
     # ---- Results summary ----
     print_results_summary(log, agent, env, HP)
 
-    # Load best checkpoint before exporting "final" weights.
-    best_prefix = os.path.join(OUTPUTS_DIR, "step4_checkpoints", "best", "agent")
+    # Reload the best checkpoint before exporting the final weights.
+    _run_dir    = os.path.join(OUTPUTS_DIR, "runs", log["run_id"])
+    best_prefix = os.path.join(_run_dir, "checkpoints", "best", "agent")
     best_actor_w = best_prefix + "_actor.weights.h5"
     best_critic_w = best_prefix + "_critic.weights.h5"
     best_alpha_w = best_prefix + "_log_alpha.npy"

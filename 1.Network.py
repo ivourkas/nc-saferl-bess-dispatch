@@ -1,50 +1,13 @@
 """
-Step 1: Build RTS-GMLC 73-bus Network in Pandapower 
-====================================================================
-Author: Yiannis Vourkas 
+Step 1: Build the RTS-GMLC 73-bus network in pandapower.
 
-Data source: https://github.com/GridMod/RTS-GMLC
-  git clone https://github.com/GridMod/RTS-GMLC.git
+This script creates the static network used by later steps, including:
+  - AC lines, transformers, and the HVDC link
+  - controllable generators with piecewise-linear marginal costs
+  - a stressed study scenario via `LINE_LIMIT_SCALE` and `FUEL_PRICE_SCALE`
 
-Network: 73 buses, 120 AC branches, 1 HVDC line, ~155 generators (3 areas).
-Bus numbering: Area 1 = 101-124, Area 2 = 201-224, Area 3 = 301-325.
-
-DATA FILES USED (from SourceData/):
-  bus.csv     - Bus ID, BaseKV, MW Load, MVAR Load, Area     (all relevant cols)
-  branch.csv  - topology, R/X/B p.u., Cont Rating, Tr Ratio  (all relevant cols)
-  gen.csv     - PMax/PMin, 4-point piecewise heat rate curve,  (full cost curve)
-                Fuel Price, VOM, Category
-  dc_branch.csv - HVDC line: bus 113 <-> bus 316, 100 MW      (modeled as dcline)
-  storage.csv   - 313_STORAGE_1 at bus 313: 50 MW / 150 MWh   (EXCLUDED - see note)
-
-DATA FILES NOT USED (with justification):
-  reserves.csv           - For publication extension (energy+reserves), not class project.
-  simulation_objects.csv - Simulation config, not needed for network model.
-  timeseries_pointers.csv - We match generators to time-series by UID directly.
-
-DESIGN DECISIONS:
-  1. Generator costs use the PIECEWISE LINEAR heat rate curve from gen.csv
-     (Output_pct_0..3, HR_avg_0, HR_Incr_1..3), not a flat average.
-  2. The existing 50 MW battery (313_STORAGE_1) is EXCLUDED from the model.
-     Our project studies where to place a NEW battery. Having background storage
-     at bus 313 (the largest PV bus) would absorb excess PV and reduce the
-     interesting locational price dynamics we want to study.
-  3. The HVDC line (bus 113 <-> bus 316, 100 MW) is modeled as a pandapower dcline.
-     Bidirectional: min_p_mw=-75, max_p_mw=+75 MW. OPF determines flow direction.
-  4. Line thermal limits are scaled by LINE_LIMIT_SCALE to approximate N-1
-     security margins, consistent with real transmission operating practices.
-  5. Slack bus is bus 113 (Ref type in bus.csv), with 113_CT_1 as ext_grid.
-  6. PMin = 0 for all generators (economic dispatch without unit commitment).
-     Equivalent to assuming optimal commitment. Standard in DC-OPF studies
-     that do not co-optimize binary on/off decisions (Barrows et al. 2019).
-
-TIME-SERIES LOADING (Part B):
-  Load/DAY_AHEAD_regional_Load.csv - Area-level load scaling factors
-  WIND/DAY_AHEAD_wind.csv          - Per-plant wind output
-  PV/DAY_AHEAD_pv.csv              - Per-plant utility PV output
-  RTPV/DAY_AHEAD_rtpv.csv          - Per-plant rooftop PV output
-  Hydro/DAY_AHEAD_hydro.csv        - Per-plant hydro output
-  CSP/DAY_AHEAD_Natural_Inflow.csv - CSP thermal inflow
+The built-in RTS battery `313_STORAGE_1` is excluded because this project
+studies a new battery placement on top of the base system.
 """
 
 import pandas as pd
@@ -63,29 +26,9 @@ LINE_LIMIT_SCALE  = 0.75     # Scale line ratings (0.7-0.8 approximates N-1 marg
 TEST_HOUR         = 5726     # Peak load hour for validation
 SN_MVA            = 100.0    # System base MVA
 
-# Fuel price scaling to match US wholesale electricity market stress conditions.
-# RTS-GMLC baseline uses 2020-era WECC-calibrated gas prices: $3.89/MMBTU.
-# Without scaling, bus 111 mean LMP ≈ $11–13/MWh — below the Xu segment-1
-# degradation breakeven ($13.93/MWh), making BESS arbitrage economically trivial.
-#
-# Scale factor 2.0× → $7.78/MMBTU for gas CTs.
-# Rationale: natural gas delivery prices at NYISO-relevant hubs in 2022:
-#   Henry Hub spot (national):      $6.45/MMBTU annual avg (EIA, Natural Gas Annual 2023)
-#   Transco Zone 6 NY (NYISO):      ~$9–12/MMBTU annual avg (2022, EIA Natural Gas Monthly)
-#   Algonquin Citygate (NE border): ~$10–15/MMBTU annual avg (2022)
-# $7.78/MMBTU is a conservative midpoint between Henry Hub and NYISO delivery
-# prices, representing realistic US Northeast wholesale market conditions in 2022.
-#
-# Reference: EIA, "Natural Gas Annual 2023," DOE/EIA-0131(2023), Nov 2024.
-#
-# Expected LMPs after scaling (re-run Step 2 for exact values):
-#   Gas CT marginal cost:  ~$54/MWh  (vs $49/MWh at 1.8×)
-#   Bus 111 annual mean:   ~$21–23/MWh
-#   Bus 111 peak LMP:      ~$82–90/MWh  → segments 1–3 profitable at peaks
-#   System-wide max LMP:   ~$185–200/MWh (congested Area 3 buses)
-FUEL_PRICE_SCALE  = 2.0   # 2.0× → $7.78/MMBTU (US Northeast high-gas 2022 scenario)
+FUEL_PRICE_SCALE  = 2.0   # stressed gas-price scenario; not the RTS baseline
 
-# Generators to EXCLUDE from the model (and why)
+# Generators excluded from the study case
 EXCLUDED_GENS = {
     "313_STORAGE_1": "Existing battery at bus 313 - excluded so we can study "
                      "placement of our own battery without background storage.",
@@ -163,14 +106,36 @@ for _, row in branch_df.iterrows():
         else:
             vn_hv, vn_lv, hv_bus, lv_bus = vn_to, vn_from, pp_to, pp_from
 
+        # Impedance base conversion:
+        # branch.csv R/X are per-unit on the SYSTEM base (SN_MVA=100 MVA).
+        # pandapower's vk_percent / vkr_percent are per-unit on the transformer's
+        # own MVA rating (rate_mva).  Conversion:
+        #
+        #   Z_trafo_pu = Z_sys_pu × (rate_mva / SN_MVA)
+        #   vk_percent = Z_trafo_pu × 100
+        #
+        # Without this factor the power-flow Ybus gets rate_mva/SN_MVA too small
+        # a susceptance, corrupting all PTDFs, line flows and LMPs.
+        sn_scale = rate_mva / SN_MVA   # e.g. 4.0 for a 400 MVA transformer
         z_pu = np.sqrt(r_pu**2 + x_pu**2)
+
+        # Off-nominal tap ratio (PSS/E winding-1 = "from bus" convention).
+        # When hv/lv are swapped (vn_from < vn_to), the from-bus becomes the LV
+        # winding, so the tap applies on the LV side.
+        # tap_step_percent=1.5 covers {1.015→tap+1, 1.03→tap+2} exactly.
+        tap_step_pct = 1.5
+        tap_pos  = int(round((tr_ratio - 1.0) * 100.0 / tap_step_pct))
+        tap_side = "lv" if vn_from < vn_to else "hv"
+
         pp.create_transformer_from_parameters(
             net, hv_bus=hv_bus, lv_bus=lv_bus,
             sn_mva=rate_mva, vn_hv_kv=vn_hv, vn_lv_kv=vn_lv,
-            vk_percent=z_pu * 100.0,
-            vkr_percent=r_pu * 100.0,
+            vk_percent=z_pu  * sn_scale * 100.0,
+            vkr_percent=r_pu * sn_scale * 100.0,
             pfe_kw=0, i0_percent=0, name=uid,
             max_loading_percent=LINE_LIMIT_SCALE * 100,
+            tap_neutral=0, tap_step_percent=tap_step_pct,
+            tap_pos=tap_pos, tap_side=tap_side,
         )
         trafo_count += 1
     else:
@@ -249,19 +214,7 @@ def is_renewable(row):
 
 
 def build_pwl_points(row):
-    """Build pandapower PWL cost points from the 4-point heat rate curve.
-    Returns list of [p_from_mw, p_to_mw, cost_per_mw] segments,
-    or None for zero-cost generators.
-
-    NOTE on PMin=0 design decision:
-    We set min_p_mw=0 for all generators (DC-OPF without unit commitment).
-    In a real system you would turn generators OFF at low load rather than
-    run them at PMin. Since we do not model commitment (binary on/off), we
-    allow every generator to dispatch down to 0 MW. The cost curve is
-    therefore extended to start at 0, using the first segment's marginal cost
-    for the [0, PMin] range.  This gives proper merit-order dispatch and
-    realistic LMPs (vs. forcing all units ON at PMin, which makes renewables
-    the marginal resource and produces LMP ≈ $0 for 96% of hours)."""
+    """Build pandapower PWL cost segments from the heat-rate curve."""
 
     if is_renewable(row):
         return None
