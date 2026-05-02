@@ -51,6 +51,7 @@ PTDF_THRESH      = 1e-5      # Lines with |PTDF| < thresh are treated as insensi
 # --- System load normalization ---
 # RTS-GMLC 2020: peak 3-area combined load ~8900 MW. Use 9500 as conservative ceiling.
 SYSTEM_LOAD_MAX  = 9500.0    # [MW] normalization for system total load
+VALIDATION_DAYS = 30         # Chronological validation block carved from pre-test data
 
 # --- Paths ---
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,17 +64,20 @@ OUTPUTS_DIR = os.path.join(_HERE, "outputs")
 
 def _compute_segment_costs(
     r_per_kwh: float = BESS_R_PER_KWH,
-    eta_dis:   float = BESS_ETA_DIS,
     j_deg:     int   = BESS_J_DEG,
 ) -> np.ndarray:
     """
-    Compute Xu-style marginal degradation costs for each segment.
+    Compute Xu-style battery-side marginal degradation costs for each segment.
+
+    These coefficients are in $/MWh extracted from the battery. The discharge
+    efficiency enters later when battery-side energy is mapped to grid-side
+    power/revenue.
     """
     Phi = lambda d: BESS_PHI_XI * d ** BESS_PHI_ALPHA
     costs = np.zeros(j_deg)
     for j in range(1, j_deg + 1):
         delta_phi = Phi(j / j_deg) - Phi((j - 1) / j_deg)
-        costs[j - 1] = (r_per_kwh * 1000.0 / eta_dis) * j_deg * delta_phi
+        costs[j - 1] = (r_per_kwh * 1000.0) * j_deg * delta_phi
     return costs
 
 
@@ -103,7 +107,9 @@ class BESSEnv(gym.Env):
         episode_len:  int   = EPISODE_LEN,
         lmp_norm:     float = LMP_NORM,
         reward_scale: float = REWARD_SCALE,
+        validation_days: int = VALIDATION_DAYS,
         seed:         Optional[int] = None,
+        ptdf_enabled: bool = True,
     ):
         super().__init__()
 
@@ -120,13 +126,14 @@ class BESSEnv(gym.Env):
         self.EPS_LEN   = episode_len
         self.LMP_NORM  = lmp_norm
         self.RWD_SCALE = reward_scale
+        self.validation_days = max(int(validation_days), 0)
+        self.ptdf_enabled = bool(ptdf_enabled)
 
         # No terminal SoC salvage term is applied.
 
         # --- Compute degradation costs ---
         self.c_deg = _compute_segment_costs(
             r_per_kwh=r_per_kwh,
-            eta_dis=eta_dis,
             j_deg=j_deg,
         )  # shape (J,) in $/MWh extracted from battery (Xu et al. 2017)
 
@@ -167,6 +174,11 @@ class BESSEnv(gym.Env):
         self.step_in_ep:  int   = 0
         self.global_t:    int   = 0          # hour index in the 8784-hour year
         self.lmp_history: np.ndarray = np.zeros(24, dtype=np.float32)
+
+        # PTDF bounds from the most recent _safety_project() call.
+        # Used to compute ptdf_violated in step() after global_t advances.
+        self._ptdf_lo_last: float = -self.P_MAX
+        self._ptdf_hi_last: float =  self.P_MAX
 
         # --- Optional RNG ---
         self._np_rng = np.random.default_rng(seed)
@@ -230,16 +242,36 @@ class BESSEnv(gym.Env):
         )
         self.fail_hours_per_episode = fail_per_start[self.valid_starts]
 
-        # Forward temporal holdout with zero episode overlap.
+        # Chronological train / validation / test split with zero episode overlap.
         N_HOURS = self.lmps.shape[0]
-        _h_split_raw = int(N_HOURS * 0.75)
-        # Snap to nearest day boundary (multiple of 24)
-        _h_split = (_h_split_raw // 24) * 24
-        _train = self.valid_starts[self.valid_starts + self.EPS_LEN <= _h_split]
-        _test  = self.valid_starts[self.valid_starts >= _h_split]
+        _test_start_raw = int(N_HOURS * 0.75)
+        self.test_start_hour = (_test_start_raw // 24) * 24
+
+        _val_hours = 24 * self.validation_days
+        _val_start_raw = max(0, self.test_start_hour - _val_hours)
+        self.val_start_hour = (_val_start_raw // 24) * 24
+        self.train_end_hour = self.val_start_hour if self.validation_days > 0 else self.test_start_hour
+        self.forecast_train_end = self.train_end_hour
+
+        _train = self.valid_starts[self.valid_starts + self.EPS_LEN <= self.train_end_hour]
+        if self.validation_days > 0:
+            _val = self.valid_starts[
+                (self.valid_starts >= self.val_start_hour)
+                & (self.valid_starts + self.EPS_LEN <= self.test_start_hour)
+            ]
+        else:
+            _val = np.empty(0, dtype=np.int32)
+        _test = self.valid_starts[self.valid_starts >= self.test_start_hour]
+
         self.train_starts = _train
-        self.test_starts  = _test
-        self._mode        = "train"    # default: sample from training pool
+        self.val_starts = _val
+        self.test_starts = _test
+        # When no val split exists, leave selection_starts empty so the training
+        # loop can switch to rolling training-return selection instead of falling
+        # back to test_starts (which would leak test data into checkpoint selection).
+        self.selection_starts = self.val_starts  # empty array when validation_days=0
+        self.selection_split_name = "validation" if len(self.val_starts) else "train_rolling"
+        self._mode = "train"    # default: sample from training pool
 
         # Normalization constants from data
         self.pv_max = float(np.nanmax(self.pv_total))  # for state normalization
@@ -266,7 +298,7 @@ class BESSEnv(gym.Env):
         print(f"  BESS bus {bess_bus_rts} -> column {self.bess_col}")
         print(f"  PTDF[l,{bess_bus_rts}] nonzero: {(np.abs(self.ptdf_k) > PTDF_THRESH).sum()} lines")
         print(f"  Valid episode starts: {len(self.valid_starts)} "
-              f"(train={len(self.train_starts)}, test={len(self.test_starts)})")
+              f"(train={len(self.train_starts)}, val={len(self.val_starts)}, test={len(self.test_starts)})")
         if len(self.fail_hours_per_episode) > 0:
             print(
                 "  Failed OPF hrs / episode (imputed): "
@@ -280,9 +312,9 @@ class BESSEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def set_mode(self, mode: str) -> None:
-        """Switch between the train and test episode-start pools."""
-        if mode not in ("train", "test"):
-            raise ValueError(f"mode must be 'train' or 'test', got {mode!r}")
+        """Switch between the train / validation / test episode-start pools."""
+        if mode not in ("train", "val", "test"):
+            raise ValueError(f"mode must be 'train', 'val', or 'test', got {mode!r}")
         self._mode = mode
 
     def reset(
@@ -305,7 +337,14 @@ class BESSEnv(gym.Env):
             self.soc      = self.SOC_INIT
         else:
             # Randomize both start hour and initial SoC during training.
-            pool = self.test_starts if self._mode == "test" else self.train_starts
+            if self._mode == "test":
+                pool = self.test_starts
+            elif self._mode == "val":
+                pool = self.val_starts
+            else:
+                pool = self.train_starts
+            if len(pool) == 0:
+                raise RuntimeError(f"No episode starts available for mode={self._mode!r}.")
             idx  = self._np_rng.integers(0, len(pool))
             self.global_t = int(pool[idx])
             soc_lo = self.SOC_MIN + 5.0   # 15 MWh  — small buffer above SOC_MIN
@@ -342,6 +381,10 @@ class BESSEnv(gym.Env):
 
         # 2. Safety QP: project onto feasible set (analytical 1D clipping)
         p_safe, p_lo, p_hi = self._safety_project(p_hat)
+        # Snapshot PTDF bounds at the CURRENT timestep before _get_obs() advances global_t
+        # and overwrites _ptdf_lo_last/_ptdf_hi_last with the next-step bounds.
+        _ptdf_lo_snap = self._ptdf_lo_last
+        _ptdf_hi_snap = self._ptdf_hi_last
 
         # 3. Update SoC
         soc_prev = self.soc
@@ -392,6 +435,14 @@ class BESSEnv(gym.Env):
             "p_safe_mw":    p_safe,
             "p_lo_mw":      p_lo,
             "p_hi_mw":      p_hi,
+            "ptdf_lo_mw":   _ptdf_lo_snap,
+            "ptdf_hi_mw":   _ptdf_hi_snap,
+            # True only when ptdf_enabled=False and the action exceeds network bounds.
+            # Always False when ptdf_enabled=True (projection guarantees feasibility).
+            "ptdf_violated": (
+                False if self.ptdf_enabled
+                else bool(p_safe < _ptdf_lo_snap - 1e-4 or p_safe > _ptdf_hi_snap + 1e-4)
+            ),
             "soc_mwh":      self.soc,
             "lmp_per_mwh":  lmp_t,
             "revenue_$":    revenue,
@@ -409,59 +460,69 @@ class BESSEnv(gym.Env):
     def _safety_project(self, p_hat: float) -> Tuple[float, float, float]:
         """
         Project the proposed battery power onto the current feasible interval.
+
+        PTDF bounds are always computed and stored in _ptdf_lo_last/_ptdf_hi_last
+        for violation tracking.  They are enforced on p_safe only when
+        self.ptdf_enabled is True (set ptdf_enabled=False for the ablation run).
         """
         # -- (a) Power rating bounds --
         p_lo = -self.P_MAX
         p_hi =  self.P_MAX
 
-        # -- (b) SoC bounds --
+        # -- (b) SoC bounds (always enforced) --
         # Discharge (P > 0): SoC_next = SoC - P*dt/eta_dis >= SOC_MIN
-        #   => P <= (SoC - SOC_MIN) * eta_dis / dt
         p_hi = min(p_hi, (self.soc - self.SOC_MIN) * self.ETA_DIS / DT)
-
         # Charge (P < 0): SoC_next = SoC + |P|*eta_ch*dt <= SOC_MAX
-        #   => -P <= (SOC_MAX - SoC) * (1 / (eta_ch * dt))
-        #   => P >= -(SOC_MAX - SoC) / (eta_ch * dt)
         p_lo = max(p_lo, -(self.SOC_MAX - self.soc) / (self.ETA_CH * DT))
 
-        # -- (c) Line flow bounds (PTDF-based) --
-        # Current baseline line flows at this timestep
+        # -- (c) Line flow bounds (PTDF-based) — always computed, optionally enforced --
         f_base = self.line_flows[self.global_t]   # (120,) MW, baseline without BESS
-
-        # Active lines: |PTDF[l, k]| > threshold
         active = np.abs(self.ptdf_k) > PTDF_THRESH
 
+        # Initialize PTDF bounds to SoC-constrained interval (worst-case if no active lines).
+        ptdf_lo = p_lo
+        ptdf_hi = p_hi
+
         if active.any():
-            ptdf_act = self.ptdf_k[active]   # (n_act,)
-            f_act    = f_base[active]         # (n_act,) MW
-            f_lmax_act = self.f_lmax[active]  # (n_act,) MW
+            ptdf_act   = self.ptdf_k[active]
+            f_act      = f_base[active]
+            f_lmax_act = self.f_lmax[active]
 
-            # Upper constraint: f_base + ptdf * P <= +F_max  =>  P <= (F_max - f_base) / ptdf
-            # Lower constraint: f_base + ptdf * P >= -F_max  =>  P >= (-F_max - f_base) / ptdf
-            # (Direction flips when ptdf < 0)
-
+            # Upper: f_base + ptdf*P <= +F_max  =>  P <= (F_max - f_base) / ptdf
+            # Lower: f_base + ptdf*P >= -F_max  =>  P >= (-F_max - f_base) / ptdf
+            # (direction flips when ptdf < 0)
             upper_from_lines = np.where(
                 ptdf_act > 0,
-                (f_lmax_act - f_act) / ptdf_act,    # ptdf > 0 -> upper bound on P
-                (-f_lmax_act - f_act) / ptdf_act,   # ptdf < 0 -> also upper bound (division flips)
+                (f_lmax_act - f_act) / ptdf_act,
+                (-f_lmax_act - f_act) / ptdf_act,
             )
             lower_from_lines = np.where(
                 ptdf_act > 0,
-                (-f_lmax_act - f_act) / ptdf_act,   # ptdf > 0 -> lower bound on P
-                (f_lmax_act - f_act) / ptdf_act,    # ptdf < 0 -> also lower bound (division flips)
+                (-f_lmax_act - f_act) / ptdf_act,
+                (f_lmax_act - f_act) / ptdf_act,
             )
+            ptdf_hi = min(p_hi, float(np.min(upper_from_lines)))
+            ptdf_lo = max(p_lo, float(np.max(lower_from_lines)))
 
-            p_hi = min(p_hi, float(np.min(upper_from_lines)))
-            p_lo = max(p_lo, float(np.max(lower_from_lines)))
+        # Feasibility guard for PTDF bounds.
+        if ptdf_lo > ptdf_hi:
+            ptdf_lo = 0.0
+            ptdf_hi = 0.0
 
-        # Feasibility guard for numerical edge cases.
-        if p_lo > p_hi:
-            p_lo = 0.0
-            p_hi = 0.0
+        # Store for ptdf_violated computation in step() — valid until next call.
+        self._ptdf_lo_last = ptdf_lo
+        self._ptdf_hi_last = ptdf_hi
 
-        # Exact 1D projection.
+        # Apply PTDF tightening only when the safety layer is active.
+        if self.ptdf_enabled:
+            p_lo, p_hi = ptdf_lo, ptdf_hi
+        else:
+            # SoC-only feasibility guard.
+            if p_lo > p_hi:
+                p_lo = 0.0
+                p_hi = 0.0
+
         p_safe = float(np.clip(p_hat, p_lo, p_hi))
-
         return p_safe, p_lo, p_hi
 
     # ------------------------------------------------------------------
@@ -611,6 +672,7 @@ class BESSEnv(gym.Env):
             f"  Action dim:        {self.action_space.shape[0]}",
             f"  Episode length:    {self.EPS_LEN} steps (1 week)",
             f"  Reward scale:      {self.RWD_SCALE} (raw $/h -> scaled units)",
+            f"  PTDF safety layer: {'ENABLED' if self.ptdf_enabled else 'DISABLED (ablation — violations tracked in info[ptdf_violated])'}",
             "=" * 65,
         ]
         return "\n".join(lines)

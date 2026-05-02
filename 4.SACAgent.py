@@ -65,26 +65,27 @@ HP = {
     "alpha_lr":       1e-5,       # entropy learning rate
     "hidden_dim":     256,        # hidden layer width
     "hidden_layers":  2,
-    "target_entropy_scale": -1, # lower entropy target for constrained 1D actions
+    "target_entropy_scale": -0.75,   # lower entropy target for constrained 1D actions
     # Buffer & batch
-    "buffer_size":    500_000,    # replay capacity
+    "buffer_size":    300_000,    # replay capacity
     "batch_size":     256,
     "min_buffer_fill": 12_000,    # dilute LP warm-start before online SAC updates
     "lp_warmstart_steps": 5_000,  # PTDF-feasible LP transitions
     "lp_bc_steps":        1000,
     "lp_bc_active_threshold": 0.02,
-    "lp_bc_active_frac":      0.85,
+    "lp_bc_active_frac":      0.50,
 
     "proj_lambda":    0.0,        # projection penalty disabled
     "n_step":         1,          # standard TD(0)
-    "init_alpha":     0.003,      # initial entropy coefficient
-    "alpha_min":      1e-5,       # lower alpha bound
+    "init_alpha":     0.005,      # initial entropy coefficient
+    "alpha_min":      1e-4,       # lower alpha bound
     "alpha_max":      0.10,       # upper alpha bound
-    "train_episodes": 5_000,      # maximum episodes; early stopping may stop earlier
+    "train_episodes": 3_000,      # fixed budget; sweep default matches
     "eval_freq":      100,        # evaluate and checkpoint every N episodes
-    "early_stop_patience":  12,
+    "early_stop_patience":  30,
     "early_stop_min_delta": 0.001,
-    "per_alpha":      0.0,        # uniform replay
+    "per_alpha":      0.6,
+    "validation_days": 30,   # 30-day val block for checkpoint selection and convergence reporting
     "seed":           42,
 }
 
@@ -672,9 +673,14 @@ class SACAgent:
         """
         with tf.GradientTape() as tape:
             _, log_pi = self.actor(obs)
-            # Clamp before stop_gradient so the clamped value is what alpha tracks.
-            # 2.0 (not 4.0): consistent with _update_critic and _update_actor.
-            log_pi = tf.clip_by_value(log_pi, -20.0, 2.0)
+            # Upper clip at 0.0 (not 2.0) for alpha only.
+            # The actor adds -log(half_width_safe) to log_pi; at PTDF-blocked steps
+            # where half_width_safe=0.1 this term is +2.3, making log_pi artificially
+            # positive. That inflated signal would push alpha toward zero on 61% of
+            # steps regardless of true policy entropy. Clipping at 0 treats any
+            # positive log_pi as a neutral signal, letting unconstrained active steps
+            # (which have genuine negative log_pi) determine the alpha direction.
+            log_pi = tf.clip_by_value(log_pi, -20.0, 0.0)
             # Stop gradient: log_pi is a constant label for alpha update
             alpha_loss = -tf.reduce_mean(
                 self.log_alpha * tf.stop_gradient(log_pi + self.target_entropy)
@@ -961,6 +967,8 @@ class PerfectForesightLP:
 
         # ------------------------------------------------------------------
         # Episode-dependent objective.
+        # c_j is in $/MWh extracted from the battery, while p_dis is grid-side
+        # discharge power. Divide by η_dis to compare both on the same basis.
         # p_dis[t,j]: (c_j/η_dis − λ_t) — profitable when λ_t > c_j/η_dis.
         # p_ch[t,j]:  λ_t               — charging costs the spot price.
         # e[t,j]:     0                  — no direct cost on stored energy.
@@ -1214,18 +1222,24 @@ def _sample_bc_batch(
 def _run_evaluation(
     agent: SACAgent,
     env:   BESSEnv,
+    starts: np.ndarray | None = None,
 ) -> dict:
-    """Run deterministic evaluation on every held-out test start."""
-    returns     = []
-    soc_ends    = []
-    soc_mins    = []
-    revenues    = []
-    deg_costs   = []
-    n_discharge = []
-    n_charge    = []
-    n_idle      = []
+    """Run deterministic evaluation on the provided episode starts."""
+    if starts is None:
+        starts = env.test_starts
 
-    for start_t in env.test_starts:
+    returns      = []
+    soc_ends     = []
+    soc_mins     = []
+    revenues     = []
+    deg_costs    = []
+    n_discharge  = []
+    n_charge     = []
+    n_idle       = []
+    n_ptdf_viol  = []   # steps with PTDF violation (non-zero only when ptdf_enabled=False)
+    n_clipped    = []   # steps where safety projection changed the action
+
+    for start_t in starts:
         obs, _    = env.reset(options={"start_t": int(start_t)})
         ep_return = 0.0
         ep_rev    = 0.0
@@ -1233,6 +1247,8 @@ def _run_evaluation(
         ep_n_dis  = 0
         ep_n_ch   = 0
         ep_n_idle = 0
+        ep_n_viol = 0
+        ep_n_clip = 0
         ep_soc_min = env.soc
 
         for _ in range(env.EPS_LEN):
@@ -1243,6 +1259,10 @@ def _run_evaluation(
             ep_deg     += info["deg_cost_$"]
             p_safe      = info["p_safe_mw"]
             ep_soc_min  = min(ep_soc_min, info["soc_mwh"])
+            if info.get("ptdf_violated", False):
+                ep_n_viol += 1
+            if info.get("clipped", False):
+                ep_n_clip += 1
             if p_safe > 0.5:
                 ep_n_dis  += 1
             elif p_safe < -0.5:
@@ -1260,33 +1280,44 @@ def _run_evaluation(
         n_discharge.append(ep_n_dis)
         n_charge.append(ep_n_ch)
         n_idle.append(ep_n_idle)
+        n_ptdf_viol.append(ep_n_viol)
+        n_clipped.append(ep_n_clip)
 
     returns     = np.array(returns)
     total_steps = np.array(n_discharge) + np.array(n_charge) + np.array(n_idle)
     return {
-        "eval_mean":      float(np.mean(returns)),
-        "eval_std":       float(np.std(returns)),
-        "eval_min":       float(np.min(returns)),
-        "eval_max":       float(np.max(returns)),
-        "n_eval":         len(returns),
-        "soc_end_mean":   float(np.mean(soc_ends)),
-        "soc_min_mean":   float(np.mean(soc_mins)),
-        "revenue_mean":   float(np.mean(revenues)),
-        "deg_cost_mean":  float(np.mean(deg_costs)),
-        "profit_mean":    float(np.mean(np.array(revenues) - np.array(deg_costs))),
-        "frac_discharge": float(np.mean(np.array(n_discharge) / np.maximum(total_steps, 1))),
-        "frac_charge":    float(np.mean(np.array(n_charge)    / np.maximum(total_steps, 1))),
-        "frac_idle":      float(np.mean(np.array(n_idle)      / np.maximum(total_steps, 1))),
+        "eval_mean":           float(np.mean(returns)),
+        "eval_std":            float(np.std(returns)),
+        "eval_min":            float(np.min(returns)),
+        "eval_max":            float(np.max(returns)),
+        "n_eval":              len(returns),
+        "soc_end_mean":        float(np.mean(soc_ends)),
+        "soc_min_mean":        float(np.mean(soc_mins)),
+        "revenue_mean":        float(np.mean(revenues)),
+        "deg_cost_mean":       float(np.mean(deg_costs)),
+        "profit_mean":         float(np.mean(np.array(revenues) - np.array(deg_costs))),
+        "frac_discharge":      float(np.mean(np.array(n_discharge) / np.maximum(total_steps, 1))),
+        "frac_charge":         float(np.mean(np.array(n_charge)    / np.maximum(total_steps, 1))),
+        "frac_idle":           float(np.mean(np.array(n_idle)      / np.maximum(total_steps, 1))),
+        # ptdf_violation_rate > 0 only when env.ptdf_enabled=False (unsafe ablation)
+        "ptdf_violation_rate": float(np.mean(np.array(n_ptdf_viol) / np.maximum(total_steps, 1))),
+        "clip_rate_mean":      float(np.mean(np.array(n_clipped)   / np.maximum(total_steps, 1))),
     }
 
 
 def _run_oracle_evaluation(env: BESSEnv) -> dict:
-    """Evaluate the perfect-foresight LP on the held-out test starts."""
+    """Evaluate the perfect-foresight LP on the provided episode starts."""
+    starts = env.test_starts
+    return _run_oracle_evaluation_on_starts(env, starts)
+
+
+def _run_oracle_evaluation_on_starts(env: BESSEnv, starts: np.ndarray) -> dict:
+    """Evaluate the perfect-foresight LP on the provided episode starts."""
     oracle = PerfectForesightLP(env)
     returns = []
     profits = []
 
-    for start_t in env.test_starts:
+    for start_t in starts:
         lmps_ep    = env.lmps[start_t:start_t + env.EPS_LEN, env.bess_col]
         flows_ep   = env.line_flows[start_t:start_t + env.EPS_LEN]
         _, p_dis, p_ch = oracle.solve(lmps_ep, flows_ep, env.SOC_INIT)
@@ -1321,6 +1352,9 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
     seed = hp["seed"]
     np.random.seed(seed)
     tf.random.set_seed(seed)
+    selection_starts = getattr(env, "selection_starts", env.test_starts)
+    selection_label = getattr(env, "selection_split_name", "test")
+    selection_tag = "val" if selection_label == "validation" else selection_label
 
     obs_dim = env.observation_space.shape[0]   # 38 (SoC+LMP+hist24+PV+step+segs4+p_lo+p_hi+sin_dow+cos_dow+load+wind)
     act_dim = env.action_space.shape[0]        # 1
@@ -1422,10 +1456,15 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
     print(f"SAC Training ({hp['train_episodes']} episodes)")
     print(f"{'='*65}")
 
-    oracle_eval = _run_oracle_evaluation(env)
-    print(f"  Held-out LP oracle: eval={oracle_eval['oracle_eval_mean']:+.4f}±"
-          f"{oracle_eval['oracle_eval_std']:.4f} | "
-          f"profit=${oracle_eval['oracle_profit_mean']:.0f}")
+    _use_rolling = len(selection_starts) == 0
+    if not _use_rolling:
+        oracle_eval = _run_oracle_evaluation_on_starts(env, selection_starts)
+        print(f"  {selection_label.title()} LP oracle: eval={oracle_eval['oracle_eval_mean']:+.4f}±"
+              f"{oracle_eval['oracle_eval_std']:.4f} | "
+              f"profit=${oracle_eval['oracle_profit_mean']:.0f}")
+    else:
+        oracle_eval = {}
+        print(f"  No val split — checkpoint selection uses rolling training return.")
 
     # Give each run its own output directory.
     _run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1444,6 +1483,7 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
         "episodes":        [],
         "run_id":          _run_id,
         "hp":              hp,
+        "selection_split": selection_label,
         "oracle_eval":     oracle_eval,
     }
 
@@ -1490,7 +1530,30 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
 
         # 4. Periodic evaluation + checkpoint
         if ep % hp["eval_freq"] == 0:
-            eval_m = _run_evaluation(agent, env)
+            if _use_rolling:
+                # No val split: use rolling average of the last eval_freq training
+                # returns as the selection signal.  This is less noisy than a 24-start
+                # val evaluation (SE ≈ $183 vs $245) and avoids test contamination.
+                _window = log["train_returns"][-hp["eval_freq"]:]
+                _r_scale = hp.get("reward_scale", 0.01)
+                eval_m = {
+                    "eval_mean":      float(np.mean(_window)),
+                    "eval_std":       float(np.std(_window)),
+                    "eval_min":       float(np.min(_window)),
+                    "eval_max":       float(np.max(_window)),
+                    "n_eval":         len(_window),
+                    "profit_mean":    float(np.mean(_window)) / _r_scale,
+                    "soc_end_mean":   0.0,
+                    "soc_min_mean":   0.0,
+                    "revenue_mean":   0.0,
+                    "deg_cost_mean":  0.0,
+                    "frac_discharge": 0.0,
+                    "frac_charge":    0.0,
+                    "frac_idle":      0.0,
+                    "clip_rate_mean": 0.0,
+                }
+            else:
+                eval_m = _run_evaluation(agent, env, starts=selection_starts)
             log["eval_returns"].append({"episode": ep, **eval_m})
 
             # Save the all-time best checkpoint separately from patience logic.
@@ -1522,28 +1585,39 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
             np.save(_log_path, log, allow_pickle=True)
 
             elapsed = time.time() - t_train_start
-            _oracle_mean = oracle_eval["oracle_eval_mean"]
-            _oracle_capture = (
-                eval_m["eval_mean"] / _oracle_mean if _oracle_mean > 1e-8 else np.nan
-            )
-            print(
-                f"  Ep {ep:4d}/{hp['train_episodes']} | "
-                f"train_ret={ep_return:+.4f} | "
-                f"eval={eval_m['eval_mean']:+.4f}±{eval_m['eval_std']:.4f} | "
-                f"oracle={_oracle_mean:+.4f} cap={_oracle_capture*100:.1f}% | "
-                f"alpha={log['alpha_values'][-1]:.4f} | "
-                f"critic_loss={log['critic_losses'][-1]:.4f} | "
-                f"SoC={eval_m['soc_end_mean']:.1f}/{eval_m['soc_min_mean']:.1f}MWh | "
-                f"profit=${eval_m['profit_mean']:.0f} "
-                f"(rev=${eval_m['revenue_mean']:.0f} deg=${eval_m['deg_cost_mean']:.0f}) | "
-                f"dis={eval_m['frac_discharge']:.0%} ch={eval_m['frac_charge']:.0%} "
-                f"idle={eval_m['frac_idle']:.0%} | "
-                f"{elapsed:.0f}s{tag}"
-            )
+            if _use_rolling:
+                print(
+                    f"  Ep {ep:4d}/{hp['train_episodes']} | "
+                    f"train_ret={ep_return:+.4f} | "
+                    f"rolling{hp['eval_freq']}={eval_m['eval_mean']:+.4f}±{eval_m['eval_std']:.4f} | "
+                    f"profit=${eval_m['profit_mean']:.0f} | "
+                    f"alpha={log['alpha_values'][-1]:.4f} | "
+                    f"critic_loss={log['critic_losses'][-1]:.4f} | "
+                    f"{elapsed:.0f}s{tag}"
+                )
+            else:
+                _oracle_mean = oracle_eval["oracle_eval_mean"]
+                _oracle_capture = (
+                    eval_m["eval_mean"] / _oracle_mean if _oracle_mean > 1e-8 else np.nan
+                )
+                print(
+                    f"  Ep {ep:4d}/{hp['train_episodes']} | "
+                    f"train_ret={ep_return:+.4f} | "
+                    f"{selection_tag}={eval_m['eval_mean']:+.4f}±{eval_m['eval_std']:.4f} | "
+                    f"oracle={_oracle_mean:+.4f} cap={_oracle_capture*100:.1f}% | "
+                    f"alpha={log['alpha_values'][-1]:.4f} | "
+                    f"critic_loss={log['critic_losses'][-1]:.4f} | "
+                    f"SoC={eval_m['soc_end_mean']:.1f}/{eval_m['soc_min_mean']:.1f}MWh | "
+                    f"profit=${eval_m['profit_mean']:.0f} "
+                    f"(rev=${eval_m['revenue_mean']:.0f} deg=${eval_m['deg_cost_mean']:.0f}) | "
+                    f"dis={eval_m['frac_discharge']:.0%} ch={eval_m['frac_charge']:.0%} "
+                    f"idle={eval_m['frac_idle']:.0%} | "
+                    f"{elapsed:.0f}s{tag}"
+                )
 
             # --- Stop if patience exceeded ---
             if no_improve >= patience:
-                print(f"\n  Early stop at ep {ep}: no min_delta improvement for "
+                print(f"\n  Early stop at ep {ep}: no min_delta improvement on {selection_label} for "
                       f"{patience} evals. "
                       f"True best eval={best_eval:+.4f} at ep {best_ep}.")
                 break
@@ -1593,21 +1667,23 @@ def print_results_summary(
     print(f"  Final critic loss       : {log['critic_losses'][-1]:.5f}")
 
     if log["eval_returns"]:
+        selection_label = log.get("selection_split", "test")
         eval_means = [e["eval_mean"] for e in log["eval_returns"]]
         best_idx   = int(np.argmax(eval_means))
-        n_test     = log["eval_returns"][0].get("n_eval", "?")
-        print(f"\nEvaluation (every {hp['eval_freq']} eps, all {n_test} test starts):")
-        print(f"  Best eval mean return   : {eval_means[best_idx]:+.4f}  "
+        n_eval     = log["eval_returns"][0].get("n_eval", "?")
+        print(f"\nSelection evaluation (every {hp['eval_freq']} eps, all {n_eval} {selection_label} starts):")
+        print(f"  Best {selection_label} mean  : {eval_means[best_idx]:+.4f}  "
               f"(ep {log['eval_returns'][best_idx]['episode']})")
-        print(f"  Final eval mean return  : {eval_means[-1]:+.4f}")
-        print(f"  Final eval std          : {log['eval_returns'][-1]['eval_std']:.4f}")
-        print(f"  Final eval min/max      : "
+        print(f"  Final {selection_label} mean : {eval_means[-1]:+.4f}")
+        print(f"  Final {selection_label} std  : {log['eval_returns'][-1]['eval_std']:.4f}")
+        print(f"  Final {selection_label} min/max : "
               f"{log['eval_returns'][-1]['eval_min']:+.4f} / "
               f"{log['eval_returns'][-1]['eval_max']:+.4f}")
-        if "oracle_eval" in log:
-            oracle_mean = log["oracle_eval"]["oracle_eval_mean"]
+        oracle_eval = log.get("oracle_eval") or {}
+        oracle_mean = oracle_eval.get("oracle_eval_mean")
+        if oracle_mean is not None:
             best_capture = eval_means[best_idx] / oracle_mean if oracle_mean > 1e-8 else np.nan
-            print(f"  Oracle eval mean return : {oracle_mean:+.4f}")
+            print(f"  Oracle {selection_label} mean: {oracle_mean:+.4f}")
             print(f"  Best oracle capture     : {best_capture*100:.1f}%")
 
     print("=" * 65)
@@ -1627,7 +1703,7 @@ def main() -> None:
     print("=" * 65)
 
     # ---- Create environment ----
-    env = BESSEnv(seed=HP["seed"])
+    env = BESSEnv(seed=HP["seed"], validation_days=HP.get("validation_days", 30))
     _device_tag = "Metal GPU" if tf.config.get_visible_devices("GPU") else "CPU"
     print(f"RTS-GMLC 73-bus | BESS bus {env.bess_bus_rts} | TF 2.x {_device_tag}")
 
@@ -1635,7 +1711,7 @@ def main() -> None:
     ptdf_binding_analysis(env, save_dir=OUTPUTS_DIR)
 
     # ---- Train ----
-    # Use held-out deterministic evaluation, not noisy train returns, for model selection.
+    # Use deterministic validation (or test fallback) evaluation, not noisy train returns, for model selection.
     t0 = time.time()
     agent, log = train_sac(env, HP)
     total_time = time.time() - t0
@@ -1664,6 +1740,17 @@ def main() -> None:
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
     agent.save(final_path)
     print(f"\nFinal agent saved -> {final_path}")
+
+    final_test = _run_evaluation(agent, env, starts=env.test_starts)
+    print("\nFinal untouched test evaluation:")
+    print(f"  Test mean return       : {final_test['eval_mean']:+.4f}")
+    print(f"  Test std               : {final_test['eval_std']:.4f}")
+    print(f"  Test min/max           : {final_test['eval_min']:+.4f} / {final_test['eval_max']:+.4f}")
+    print(f"  Profit mean            : ${final_test['profit_mean']:.0f}")
+    print(f"  Revenue / deg cost     : ${final_test['revenue_mean']:.0f} / ${final_test['deg_cost_mean']:.0f}")
+    print(f"  SoC end / min mean     : {final_test['soc_end_mean']:.1f} / {final_test['soc_min_mean']:.1f} MWh")
+    print(f"  Action mix             : dis={final_test['frac_discharge']:.0%} "
+          f"ch={final_test['frac_charge']:.0%} idle={final_test['frac_idle']:.0%}")
     print("\nStep 4 complete.  Ready for Step 5 (analysis / paper figures).")
 
 
