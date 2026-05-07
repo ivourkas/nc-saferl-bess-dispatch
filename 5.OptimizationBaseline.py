@@ -861,9 +861,8 @@ def main() -> None:
         print(f"  Val profit mean     : ${validation_eval['profit_mean']:.0f}")
 
     # Rebuild the forecaster with all causal history available before the test block.
-    # This matches the final-test policy used in Step 6: train-only history governs
-    # any pre-test checks, while the frozen final controller may use train+val history
-    # once the held-out test begins.
+    # Train-only history governs any pre-test checks, while the frozen final
+    # controller may use train+val history once the held-out test begins.
     saved_fte = env.forecast_train_end
     env.forecast_train_end = env.test_start_hour
     test_forecaster = AnalogForecaster(

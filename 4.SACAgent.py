@@ -62,30 +62,37 @@ HP = {
     "gamma":          0.99,       # discount factor
     "tau":            0.005,      # target-network soft-update rate
     "lr":             1e-4,       # actor/critic learning rate
-    "alpha_lr":       1e-5,       # entropy learning rate
+    "alpha_lr":       3e-5,       # entropy learning rate; faster recovery from alpha floor
     "hidden_dim":     256,        # hidden layer width
     "hidden_layers":  2,
-    "target_entropy_scale": -0.75,   # lower entropy target for constrained 1D actions
+    "target_entropy_scale": -1,  # target_entropy = -1 × action_dim (automatic entropy tuning disabled by default for stability; set to -action_dim to enable)
     # Buffer & batch
     "buffer_size":    300_000,    # replay capacity
     "batch_size":     256,
     "min_buffer_fill": 12_000,    # dilute LP warm-start before online SAC updates
-    "lp_warmstart_steps": 5_000,  # PTDF-feasible LP transitions
-    "lp_bc_steps":        1000,
+    "lp_warmstart_steps": 15_000,  # PTDF-feasible LP transitions
+    "lp_warmstart_priority_scale": 0.3,  # retroactively lower LP priorities so online transitions dominate PER sampling
+    "lp_bc_steps":        3000,
     "lp_bc_active_threshold": 0.02,
-    "lp_bc_active_frac":      0.50,
+    "lp_bc_active_frac":      0.05,  
+    "action_scale_floor": 0.0,      # Jacobian floor for bounded actor; 0.04 = 1 MW on a 25 MW battery
+    "randomize_train_soc": True,     # Train-only SoC randomization broadens charge/discharge exposure; eval stays at SOC_INIT
 
     "proj_lambda":    0.0,        # projection penalty disabled
-    "n_step":         1,          # standard TD(0)
+    "n_step":         4,          # 4-step TD: propagates SoC opportunity-cost 4 steps back
     "init_alpha":     0.005,      # initial entropy coefficient
-    "alpha_min":      1e-4,       # lower alpha bound
+    "alpha_min":      0.005,      # higher floor prevents absorbing-state collapse; alpha_lr=3e-5 now fast enough to recover
     "alpha_max":      0.10,       # upper alpha bound
-    "train_episodes": 3_000,      # fixed budget; sweep default matches
-    "eval_freq":      100,        # evaluate and checkpoint every N episodes
-    "early_stop_patience":  30,
+    "utd_ratio_denominator": 4,   # UTD=0.25: one gradient step per 4 env steps (RLBattEM4 literature)
+    "train_episodes": 2_000,      # dev default; paper seed sweeps use 3000
+    "eval_freq":      100,        # dev default; sweep uses 200 (full train-set eval is ~11× more expensive)
+    "early_stop_patience":  10,   # plateau patience (consecutive evals without min_delta improvement)
     "early_stop_min_delta": 0.001,
+    "early_stop_max_degradation": 0.5,   # stop if eval drops >0.5 below best (Q-overfit guard)
+    "early_stop_degrade_patience": 4,    # consecutive degraded evals before stopping
     "per_alpha":      0.6,
-    "validation_days": 30,   # 30-day val block for checkpoint selection and convergence reporting
+    "terminal_soc_weight": 1.0,   # end-of-episode SoC L1 penalty toward episode-start SoC; 0.5 ≈ half c_j[0] signal per MWh
+    "validation_days": 30,   # dev default; sweep uses 0 → selection on full train set (SEM≈0.62 vs 2.0)
     "seed":           42,
 }
 
@@ -302,8 +309,15 @@ class SquashedGaussianActor(tf.keras.Model):
     _LMP_END    = 26
     _SCALAR_IDX = [0] + list(range(26, 38))   # SoC(1) + scalars[26..37](12) = 13 total
 
-    def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int = 256):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        hidden_dim: int = 256,
+        action_scale_floor: float = 0.04,
+    ):
         super().__init__()
+        self.action_scale_floor = float(action_scale_floor)
 
         # --- LMP multi-scale temporal stream ---
         # Short-range: kernel=4 captures 4-hour local price spikes.
@@ -312,13 +326,14 @@ class SquashedGaussianActor(tf.keras.Model):
         # Medium-range: kernel=8 captures 8-hour intra-day price trends.
         self.lmp_conv_long  = tf.keras.layers.Conv1D(32, kernel_size=8, strides=1,
                                                       padding="causal", activation="relu")
-        self.lmp_pool_short = tf.keras.layers.GlobalAveragePooling1D()
-        self.lmp_pool_long  = tf.keras.layers.GlobalAveragePooling1D()
-        # Fuse 64-dim multi-scale feature → 32-dim temporal embedding
+        # Full-day: kernel=24 closes the receptive-field gap to the daily LMP cycle.
+        self.lmp_conv_daily = tf.keras.layers.Conv1D(32, kernel_size=24, strides=1,
+                                                      padding="causal", activation="relu")
+        # Each branch: concat(last_position, avg) → 64-dim; fuse 3×64=192 → 32
         self.lmp_dense      = tf.keras.layers.Dense(32, activation="relu")
 
         # --- Scalar physical stream ---
-        self.scalar_dense = tf.keras.layers.Dense(32, activation="relu")
+        self.scalar_dense = tf.keras.layers.Dense(64, activation="relu")
 
         # Normalize the fused embedding before the shared trunk.
         self.joint_ln = tf.keras.layers.LayerNormalization()
@@ -344,31 +359,55 @@ class SquashedGaussianActor(tf.keras.Model):
         # LMP stream: (batch, 25) → (batch, 25, 1) for Conv1D
         lmp = tf.expand_dims(obs[:, self._LMP_START:self._LMP_END], axis=-1)
 
-        # Dual-scale convolution + global average pooling
-        short_e = self.lmp_pool_short(self.lmp_conv_short(lmp))   # (batch, 32)
-        long_e  = self.lmp_pool_long(self.lmp_conv_long(lmp))     # (batch, 32)
-        lmp_e   = self.lmp_dense(tf.concat([short_e, long_e], axis=-1))  # (batch, 32)
+        # Triple-scale convolution; last position retains full causal context, avg adds stability
+        short_c = self.lmp_conv_short(lmp)                                              # (batch, 25, 32)
+        long_c  = self.lmp_conv_long(lmp)                                               # (batch, 25, 32)
+        daily_c = self.lmp_conv_daily(lmp)                                              # (batch, 25, 32)
+        short_e = tf.concat([short_c[:, -1, :], tf.reduce_mean(short_c, axis=1)], axis=-1)  # (batch, 64)
+        long_e  = tf.concat([long_c[:,  -1, :], tf.reduce_mean(long_c,  axis=1)], axis=-1)  # (batch, 64)
+        daily_e = tf.concat([daily_c[:, -1, :], tf.reduce_mean(daily_c, axis=1)], axis=-1)  # (batch, 64)
+        lmp_e   = self.lmp_dense(tf.concat([short_e, long_e, daily_e], axis=-1))       # (batch, 32)
 
         # Scalar stream (use pre-built index to avoid per-call tf.constant allocation)
         scalar     = tf.gather(obs, self._scalar_idx_tf, axis=1)   # (batch, 13)
-        scalar_e   = self.scalar_dense(scalar)                     # (batch, 32)
+        scalar_e   = self.scalar_dense(scalar)                     # (batch, 64)
 
         # LayerNorm on concatenated embedding, then joint trunk
-        joint = self.joint_ln(tf.concat([lmp_e, scalar_e], axis=-1))  # (batch, 64) normalised
+        joint = self.joint_ln(tf.concat([lmp_e, scalar_e], axis=-1))  # (batch, 96) normalised
         return self.trunk2(self.trunk1(joint))                         # (batch, 256)
 
     def _distribution_params(self, obs: tf.Tensor):
         """Return Gaussian parameters for the latent normalized action."""
-        _LOGIT_CLIP = 3.0   # mu ∈ [-3, 3]; tanh(3) = 0.995 ≈ full power
+        _LOGIT_CLIP = 3.0   # clip (not tanh): straight-through gradient for |mu_raw|<3; tanh(3)=0.995≈full power
         h = self._encode(obs)
         mu_raw  = self.mu_layer(h)
-        mu      = _LOGIT_CLIP * tf.tanh(mu_raw)   # bounded ∈ (-3, 3)
+        mu      = tf.clip_by_value(mu_raw, -_LOGIT_CLIP, _LOGIT_CLIP)
         log_std = tf.clip_by_value(self.log_std_layer(h), LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std
 
     # Obs indices for PTDF safety bounds (must match BESSEnvironment._get_obs layout)
     _P_LO_IDX = 32   # obs[32] = p_lo / P_MAX  ∈ [-1, 0]
     _P_HI_IDX = 33   # obs[33] = p_hi / P_MAX  ∈ [0, 1]
+
+    def _map_to_feasible_interval(
+        self,
+        u: tf.Tensor,
+        p_lo_norm: tf.Tensor,
+        p_hi_norm: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        """
+        Map squashed latent action u=tanh(z) into [p_lo_norm, p_hi_norm] while
+        preserving 0 as the neutral point.
+
+        Positive u spans [0, p_hi], negative u spans [p_lo, 0].  This removes
+        the midpoint bias of the old affine map, where u=0 implied the interval
+        center rather than zero dispatch.
+        """
+        pos_scale = tf.maximum(p_hi_norm, 0.0)
+        neg_scale = tf.maximum(-p_lo_norm, 0.0)
+        scale = tf.where(u >= 0.0, pos_scale, neg_scale)
+        action = scale * u
+        return action, scale
 
     def call(self, obs):
         """
@@ -380,12 +419,11 @@ class SquashedGaussianActor(tf.keras.Model):
         # Extract PTDF safety bounds from observation
         p_lo_norm = obs[:, self._P_LO_IDX : self._P_LO_IDX + 1]   # (batch, 1) ∈ [-1, 0]
         p_hi_norm = obs[:, self._P_HI_IDX : self._P_HI_IDX + 1]   # (batch, 1) ∈ [0, 1]
-        center     = (p_hi_norm + p_lo_norm) * 0.5   # ∈ [-0.5, 0.5]
-        half_width = (p_hi_norm - p_lo_norm) * 0.5   # ∈ [0, 1]
 
         # Reparameterization trick
         eps = tf.random.normal(tf.shape(mu))
         z = mu + std * eps
+        u = tf.tanh(z)
 
         # Log probability under Gaussian (pre-squashing)
         log_pi_normal = (
@@ -396,16 +434,14 @@ class SquashedGaussianActor(tf.keras.Model):
 
         # Tanh squashing correction (same formula as standard SAC)
         squash_correction = tf.reduce_sum(
-            tf.math.log(1.0 - tf.tanh(z) ** 2 + 1e-6),
+            tf.math.log(1.0 - u ** 2 + 1e-6),
             axis=-1, keepdims=True,
         )
 
-        # Width penalty for narrow feasible intervals.
-        half_width_safe = tf.maximum(half_width, 0.1)
-        log_pi = log_pi_normal - tf.math.log(half_width_safe) - squash_correction
+        action, scale = self._map_to_feasible_interval(u, p_lo_norm, p_hi_norm)
+        scale_safe = tf.maximum(scale, self.action_scale_floor)
+        log_pi = log_pi_normal - tf.math.log(scale_safe) - squash_correction
 
-        # Bounded action: center + half_width * tanh(z)  ∈ [p_lo_norm, p_hi_norm]
-        action = center + half_width * tf.tanh(z)
         return action, log_pi
 
     def get_deterministic_action(self, obs):
@@ -413,9 +449,8 @@ class SquashedGaussianActor(tf.keras.Model):
         mu, _ = self._distribution_params(obs)
         p_lo_norm = obs[:, self._P_LO_IDX : self._P_LO_IDX + 1]
         p_hi_norm = obs[:, self._P_HI_IDX : self._P_HI_IDX + 1]
-        center     = (p_hi_norm + p_lo_norm) * 0.5
-        half_width = (p_hi_norm - p_lo_norm) * 0.5
-        return center + half_width * tf.tanh(mu)
+        action, _ = self._map_to_feasible_interval(tf.tanh(mu), p_lo_norm, p_hi_norm)
+        return action
 
 
 class TwinQCritic(tf.keras.Model):
@@ -439,10 +474,10 @@ class TwinQCritic(tf.keras.Model):
                                                          padding="causal", activation="relu")
         self.q1_lmp_conv_long  = tf.keras.layers.Conv1D(32, kernel_size=8, strides=1,
                                                          padding="causal", activation="relu")
-        self.q1_lmp_pool_short = tf.keras.layers.GlobalAveragePooling1D()
-        self.q1_lmp_pool_long  = tf.keras.layers.GlobalAveragePooling1D()
+        self.q1_lmp_conv_daily = tf.keras.layers.Conv1D(32, kernel_size=24, strides=1,
+                                                         padding="causal", activation="relu")
         self.q1_lmp_dense      = tf.keras.layers.Dense(32, activation="relu")
-        self.q1_scalar         = tf.keras.layers.Dense(32, activation="relu")
+        self.q1_scalar         = tf.keras.layers.Dense(64, activation="relu")
         self.q1_joint_ln       = tf.keras.layers.LayerNormalization()
         self.q1_fc1            = tf.keras.layers.Dense(hidden_dim, activation="relu")
         self.q1_fc2            = tf.keras.layers.Dense(hidden_dim, activation="relu")
@@ -453,10 +488,10 @@ class TwinQCritic(tf.keras.Model):
                                                          padding="causal", activation="relu")
         self.q2_lmp_conv_long  = tf.keras.layers.Conv1D(32, kernel_size=8, strides=1,
                                                          padding="causal", activation="relu")
-        self.q2_lmp_pool_short = tf.keras.layers.GlobalAveragePooling1D()
-        self.q2_lmp_pool_long  = tf.keras.layers.GlobalAveragePooling1D()
+        self.q2_lmp_conv_daily = tf.keras.layers.Conv1D(32, kernel_size=24, strides=1,
+                                                         padding="causal", activation="relu")
         self.q2_lmp_dense      = tf.keras.layers.Dense(32, activation="relu")
-        self.q2_scalar         = tf.keras.layers.Dense(32, activation="relu")
+        self.q2_scalar         = tf.keras.layers.Dense(64, activation="relu")
         self.q2_joint_ln       = tf.keras.layers.LayerNormalization()
         self.q2_fc1            = tf.keras.layers.Dense(hidden_dim, activation="relu")
         self.q2_fc2            = tf.keras.layers.Dense(hidden_dim, activation="relu")
@@ -466,19 +501,23 @@ class TwinQCritic(tf.keras.Model):
         self._scalar_idx_tf = tf.constant(self._SCALAR_IDX, dtype=tf.int32)
 
     def _encode_one(self, obs, act,
-                    lmp_cs, lmp_cl, lmp_ps, lmp_pl, lmp_d,
+                    lmp_cs, lmp_cl, lmp_cd, lmp_d,
                     scalar_d, joint_ln, fc1, fc2, out):
         """Shared encoder path for one critic head."""
         lmp = tf.expand_dims(obs[:, self._LMP_START:self._LMP_END], axis=-1)
 
-        short_e = lmp_ps(lmp_cs(lmp))                             # (batch, 32)
-        long_e  = lmp_pl(lmp_cl(lmp))                             # (batch, 32)
-        lmp_e   = lmp_d(tf.concat([short_e, long_e], axis=-1))    # (batch, 32)
+        short_c = lmp_cs(lmp)                                                           # (batch, 25, 32)
+        long_c  = lmp_cl(lmp)                                                           # (batch, 25, 32)
+        daily_c = lmp_cd(lmp)                                                           # (batch, 25, 32)
+        short_e = tf.concat([short_c[:, -1, :], tf.reduce_mean(short_c, axis=1)], axis=-1)  # (batch, 64)
+        long_e  = tf.concat([long_c[:,  -1, :], tf.reduce_mean(long_c,  axis=1)], axis=-1)  # (batch, 64)
+        daily_e = tf.concat([daily_c[:, -1, :], tf.reduce_mean(daily_c, axis=1)], axis=-1)  # (batch, 64)
+        lmp_e   = lmp_d(tf.concat([short_e, long_e, daily_e], axis=-1))                # (batch, 32)
 
-        scalar     = tf.gather(obs, self._scalar_idx_tf, axis=1)
-        scalar_e   = scalar_d(tf.concat([scalar, act], axis=-1))   # action in scalar stream
+        scalar   = tf.gather(obs, self._scalar_idx_tf, axis=1)
+        scalar_e = scalar_d(tf.concat([scalar, act], axis=-1))                          # action in scalar stream
 
-        joint = joint_ln(tf.concat([lmp_e, scalar_e], axis=-1))   # (batch, 64) normalised
+        joint = joint_ln(tf.concat([lmp_e, scalar_e], axis=-1))
         return out(fc2(fc1(joint)))
 
     def call(self, inputs):
@@ -486,12 +525,12 @@ class TwinQCritic(tf.keras.Model):
         obs, act = inputs
         q1 = self._encode_one(obs, act,
                                self.q1_lmp_conv_short, self.q1_lmp_conv_long,
-                               self.q1_lmp_pool_short, self.q1_lmp_pool_long,
+                               self.q1_lmp_conv_daily,
                                self.q1_lmp_dense, self.q1_scalar, self.q1_joint_ln,
                                self.q1_fc1, self.q1_fc2, self.q1_out)
         q2 = self._encode_one(obs, act,
                                self.q2_lmp_conv_short, self.q2_lmp_conv_long,
-                               self.q2_lmp_pool_short, self.q2_lmp_pool_long,
+                               self.q2_lmp_conv_daily,
                                self.q2_lmp_dense, self.q2_scalar, self.q2_joint_ln,
                                self.q2_fc1, self.q2_fc2, self.q2_out)
         return q1, q2
@@ -516,7 +555,10 @@ class SACAgent:
         hidden_dim = hp["hidden_dim"]
 
         # --- Networks ---
-        self.actor         = SquashedGaussianActor(obs_dim, act_dim, hidden_dim)
+        self.actor         = SquashedGaussianActor(
+            obs_dim, act_dim, hidden_dim,
+            action_scale_floor=float(hp.get("action_scale_floor", 0.04)),
+        )
         self.critic        = TwinQCritic(obs_dim, act_dim, hidden_dim)
         self.critic_target = TwinQCritic(obs_dim, act_dim, hidden_dim)
 
@@ -611,7 +653,9 @@ class SACAgent:
         next_act, next_log_pi = self.actor(next_obs)
 
         # Clamp log_pi to keep targets numerically stable.
-        next_log_pi = tf.clip_by_value(next_log_pi, -20.0, 2.0)
+        # Upper bound: at half_width=0.1 (PTDF-constrained) and log_std=-2,
+        # log_pi ≈ 3.4; with log_std=-5 (floor) it can reach ~6. Cap at 4.0.
+        next_log_pi = tf.clip_by_value(next_log_pi, -20.0, 4.0)
 
         # N-step target Q values.
         q1_next, q2_next = self.critic_target([next_obs, next_act])
@@ -652,9 +696,7 @@ class SACAgent:
         """
         with tf.GradientTape() as tape:
             act, log_pi = self.actor(obs)    # a_safe in [p_lo_norm, p_hi_norm]
-            # Clamp log_pi (same as _update_critic for consistency).
-            # With bounded-tanh: max log_pi ≈ +1 for blocked steps → safely below 2.0.
-            log_pi = tf.clip_by_value(log_pi, -20.0, 2.0)
+            log_pi = tf.clip_by_value(log_pi, -20.0, 4.0)
             q1, q2 = self.critic([obs, act])          # Q at safe action
             min_q   = tf.minimum(q1, q2)
             proj_pen = tf.constant(0.0)               # no projection needed (kept for log API)
@@ -1076,9 +1118,11 @@ def run_episode_collect(
     buffer: ReplayBuffer,
     n_step: int   = 1,
     gamma:  float = 0.99,
+    terminal_soc_weight: float = 0.0,
 ) -> tuple:
     """Collect one rollout and store N-step transitions in replay."""
-    obs, _    = env.reset()
+    obs, reset_info = env.reset()
+    soc_episode_init = float(reset_info["soc_init_mwh"])   # actual starting SoC (random in train, SOC_INIT in eval)
     ep_return = 0.0
     ep_infos  = []
     n_added   = 0
@@ -1093,6 +1137,13 @@ def run_episode_collect(
         act = np.clip(act, -1.0, 1.0)              # float32 overflow guard only
         next_obs, rew, terminated, truncated, info = env.step(act)
         done = terminated or truncated
+
+        # Terminal SoC shaping: L1 penalty on net energy extracted this episode.
+        # Target is soc_episode_init (the actual reset SoC, random in train) so the
+        # signal is always "return the battery to where it started", not a fixed constant.
+        # Applied here (training only); _run_evaluation() is untouched → clean metrics.
+        if terminated and terminal_soc_weight > 0.0:
+            rew = float(rew) - terminal_soc_weight * env.c_deg[0] * abs(env.soc - soc_episode_init) * env.RWD_SCALE
 
         # Projected action and safety bounds for Convention B
         act_proj  = np.array([info["p_safe_mw"] / env.P_MAX], dtype=np.float32)
@@ -1127,23 +1178,21 @@ def lp_warmstart(
     buffer:    ReplayBuffer,
     lp_oracle: "PerfectForesightLP",
     n_target:  int,
-    n_step:    int   = 1,
     gamma:     float = 0.99,
 ) -> int:
     """
     Pre-fill the replay buffer with PTDF-feasible LP trajectories.
 
-    LP warm-start always stores 1-step transitions, even if online SAC uses a
-    larger N-step horizon.
+    Always stores 1-step transitions regardless of the online SAC n_step.
     """
-    _lp_nstep = 1   # always 1; do not change to hp["n_step"]
+    _lp_nstep = 1
     n_added = 0
 
     while n_added < n_target:
-        obs, _ = env.reset()   # randomises SoC in training mode
+        obs, _ = env.reset()   # training reset; start SoC follows the env protocol
 
         start_t    = env.global_t
-        soc_start  = env.soc                                          # randomised SoC [MWh]
+        soc_start  = env.soc                                          # episode-start SoC [MWh]
         lmps_ep    = env.lmps[start_t : start_t + env.EPS_LEN, env.bess_col]
         f_base_ep  = env.line_flows[start_t : start_t + env.EPS_LEN] # (T, 120)
         _, p_dis, p_ch = lp_oracle.solve(lmps_ep, f_base_ep, soc_init=soc_start)
@@ -1382,7 +1431,7 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
     # ---- LP Expert Warm-Start ----
     _ws_steps = hp.get("lp_warmstart_steps", 0)
     _bc_threshold = float(hp.get("lp_bc_active_threshold", 0.02))
-    _bc_active_frac = float(hp.get("lp_bc_active_frac", 0.75))
+    _bc_active_frac = float(hp.get("lp_bc_active_frac", 0.10))
 
     if _ws_steps > 0:
         print(f"\n{'='*65}")
@@ -1401,7 +1450,6 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
         n_ws = lp_warmstart(
             env, buffer, _lp_oracle,
             n_target=_ws_steps,
-            n_step=hp.get("n_step", 1),
             gamma=hp["gamma"],
         )
         print(f"  Added {n_ws} LP transitions in {time.time()-_t_ws:.1f}s  "
@@ -1412,6 +1460,18 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
         _lp_idle = float(np.mean(np.abs(_lp_actions) <= _bc_threshold))
         print(f"  LP replay mix: dis={_lp_dis*100:.1f}%  "
               f"ch={_lp_ch*100:.1f}%  idle={_lp_idle*100:.1f}%")
+
+        # Retroactively lower LP warmstart priorities so online TD transitions
+        # dominate PER sampling once SAC starts.  New online transitions will be
+        # inserted at buffer._max_priority (still 1.0), so they are sampled far
+        # more often than these deflated LP entries (scale×1.0).
+        _lp_pscale = float(hp.get("lp_warmstart_priority_scale", 1.0))
+        if _lp_pscale < 1.0 and n_ws > 0:
+            _lp_p = max(buffer.per_eps ** buffer.per_alpha, _lp_pscale * buffer._max_priority)
+            for _idx in range(n_ws):
+                buffer._sum_tree.update(_idx, _lp_p)
+            print(f"  LP priority scaled ×{_lp_pscale:.2f} → {_lp_p:.4f} each "
+                  f"(online transitions will be inserted at {buffer._max_priority:.4f})")
 
     # ---- LP Actor BC Pre-Training ----
     # Pretrain the actor on stored LP actions before SAC updates begin.
@@ -1435,7 +1495,7 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
                 # Clone the deterministic policy mean.
                 _act_pred = agent.actor.get_deterministic_action(_obs_b)  # (batch, 1)
                 # Slightly upweight active LP transitions on top of stratified sampling.
-                _active_w = 1.0 + 4.0 * tf.cast(tf.abs(_act_lp) > _bc_threshold, tf.float32)
+                _active_w = 1.0 + 0.0 * tf.cast(tf.abs(_act_lp) > _bc_threshold, tf.float32)
                 _bc_loss  = tf.reduce_mean(_active_w * (_act_pred - _act_lp) ** 2)
             _grads = _tape.gradient(_bc_loss, agent.actor.trainable_variables)
             _grads_and_vars = [
@@ -1445,9 +1505,29 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
             ]
             agent.actor_opt.apply_gradients(_grads_and_vars)
             _bc_losses.append(float(_bc_loss))
+        # Extend BC if not yet converged: guards against unlucky TF initialization.
+        _bc_loss_floor = 0.060
+        _extra = 0
+        while float(np.mean(_bc_losses[-100:])) > _bc_loss_floor and _extra < 2000:
+            _obs_np, _act_np = _sample_bc_batch(buffer, hp["batch_size"],
+                                                active_threshold=_bc_threshold,
+                                                active_frac=_bc_active_frac)
+            _obs_b  = tf.constant(_obs_np, dtype=tf.float32)
+            _act_lp = tf.constant(_act_np, dtype=tf.float32)
+            with tf.GradientTape() as _tape:
+                _act_pred = agent.actor.get_deterministic_action(_obs_b)
+                _active_w = 1.0 + 1.0 * tf.cast(tf.abs(_act_lp) > _bc_threshold, tf.float32)
+                _bc_loss  = tf.reduce_mean(_active_w * (_act_pred - _act_lp) ** 2)
+            _grads = _tape.gradient(_bc_loss, agent.actor.trainable_variables)
+            agent.actor_opt.apply_gradients(
+                [(_g, _v) for _g, _v in zip(_grads, agent.actor.trainable_variables) if _g is not None]
+            )
+            _bc_losses.append(float(_bc_loss))
+            _extra += 1
         print(f"  BC done in {time.time()-_bc_t:.1f}s: "
               f"loss {_bc_losses[0]:.4f} → {_bc_losses[-1]:.4f}  "
-              f"(mean last 100: {float(np.mean(_bc_losses[-100:])):.4f})")
+              f"(mean last 100: {float(np.mean(_bc_losses[-100:])):.4f}"
+              f"{f', +{_extra} ext steps' if _extra else ''})")
         print(f"  BC sampler mix: target active share={_bc_active_frac*100:.0f}% "
               f"above |a|>{_bc_threshold:.2f}")
 
@@ -1456,15 +1536,10 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
     print(f"SAC Training ({hp['train_episodes']} episodes)")
     print(f"{'='*65}")
 
-    _use_rolling = len(selection_starts) == 0
-    if not _use_rolling:
-        oracle_eval = _run_oracle_evaluation_on_starts(env, selection_starts)
-        print(f"  {selection_label.title()} LP oracle: eval={oracle_eval['oracle_eval_mean']:+.4f}±"
-              f"{oracle_eval['oracle_eval_std']:.4f} | "
-              f"profit=${oracle_eval['oracle_profit_mean']:.0f}")
-    else:
-        oracle_eval = {}
-        print(f"  No val split — checkpoint selection uses rolling training return.")
+    oracle_eval = _run_oracle_evaluation_on_starts(env, selection_starts)
+    print(f"  {selection_label.title()} LP oracle: eval={oracle_eval['oracle_eval_mean']:+.4f}±"
+          f"{oracle_eval['oracle_eval_std']:.4f} | "
+          f"profit=${oracle_eval['oracle_profit_mean']:.0f}")
 
     # Give each run its own output directory.
     _run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1494,6 +1569,10 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
     best_eval_patience = -np.inf  # best eval used for patience counting (requires min_delta)
     no_improve        = 0         # consecutive evals without min_delta improvement
     best_ep           = 0         # episode at which best_eval was achieved
+    # Degradation guard: stop when Q-overfit drives eval below peak
+    degrade_patience  = int(hp.get("early_stop_degrade_patience", 0))
+    max_degradation   = float(hp.get("early_stop_max_degradation", np.inf))
+    no_degrade        = 0         # consecutive evals more than max_degradation below best
 
     t_train_start = time.time()
 
@@ -1504,16 +1583,18 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
             agent, env, buffer,
             n_step=hp.get("n_step", 1),
             gamma=hp["gamma"],
+            terminal_soc_weight=float(hp.get("terminal_soc_weight", 0.0)),
         )
 
         # Anneal the PER importance-sampling exponent.
         buffer.anneal_beta(ep / hp["train_episodes"])
 
-        # One gradient step per collected transition after warm-up.
+        # UTD=0.25: one gradient step every 4 env steps; matches 
         _min_fill = hp.get("min_buffer_fill", hp["batch_size"])
+        _utd_denom = int(hp.get("utd_ratio_denominator", 1))
         c_losses, a_losses, alphas, proj_pens = [], [], [], []
-        for _ in range(n_collected):
-            if len(buffer) >= _min_fill:
+        for _i in range(n_collected):
+            if len(buffer) >= _min_fill and _i % _utd_denom == 0:
                 m = agent.train_step(buffer)
                 c_losses.append(m["critic_loss"])
                 a_losses.append(m["actor_loss"])
@@ -1530,30 +1611,7 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
 
         # 4. Periodic evaluation + checkpoint
         if ep % hp["eval_freq"] == 0:
-            if _use_rolling:
-                # No val split: use rolling average of the last eval_freq training
-                # returns as the selection signal.  This is less noisy than a 24-start
-                # val evaluation (SE ≈ $183 vs $245) and avoids test contamination.
-                _window = log["train_returns"][-hp["eval_freq"]:]
-                _r_scale = hp.get("reward_scale", 0.01)
-                eval_m = {
-                    "eval_mean":      float(np.mean(_window)),
-                    "eval_std":       float(np.std(_window)),
-                    "eval_min":       float(np.min(_window)),
-                    "eval_max":       float(np.max(_window)),
-                    "n_eval":         len(_window),
-                    "profit_mean":    float(np.mean(_window)) / _r_scale,
-                    "soc_end_mean":   0.0,
-                    "soc_min_mean":   0.0,
-                    "revenue_mean":   0.0,
-                    "deg_cost_mean":  0.0,
-                    "frac_discharge": 0.0,
-                    "frac_charge":    0.0,
-                    "frac_idle":      0.0,
-                    "clip_rate_mean": 0.0,
-                }
-            else:
-                eval_m = _run_evaluation(agent, env, starts=selection_starts)
+            eval_m = _run_evaluation(agent, env, starts=selection_starts)
             log["eval_returns"].append({"episode": ep, **eval_m})
 
             # Save the all-time best checkpoint separately from patience logic.
@@ -1575,6 +1633,14 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
                 no_improve += 1
                 tag += f" (no improve {no_improve}/{patience})"
 
+            # Degradation guard: track consecutive evals below (best - max_degradation).
+            if degrade_patience > 0:
+                if eval_m["eval_mean"] < best_eval - max_degradation:
+                    no_degrade += 1
+                    tag += f" (degrade {no_degrade}/{degrade_patience})"
+                else:
+                    no_degrade = 0
+
             # Save the periodic checkpoint for later inspection.
             ckpt_path = os.path.join(checkpoint_dir, f"ep{ep:04d}", "agent")
             os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
@@ -1585,40 +1651,37 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
             np.save(_log_path, log, allow_pickle=True)
 
             elapsed = time.time() - t_train_start
-            if _use_rolling:
-                print(
-                    f"  Ep {ep:4d}/{hp['train_episodes']} | "
-                    f"train_ret={ep_return:+.4f} | "
-                    f"rolling{hp['eval_freq']}={eval_m['eval_mean']:+.4f}±{eval_m['eval_std']:.4f} | "
-                    f"profit=${eval_m['profit_mean']:.0f} | "
-                    f"alpha={log['alpha_values'][-1]:.4f} | "
-                    f"critic_loss={log['critic_losses'][-1]:.4f} | "
-                    f"{elapsed:.0f}s{tag}"
-                )
-            else:
-                _oracle_mean = oracle_eval["oracle_eval_mean"]
-                _oracle_capture = (
-                    eval_m["eval_mean"] / _oracle_mean if _oracle_mean > 1e-8 else np.nan
-                )
-                print(
-                    f"  Ep {ep:4d}/{hp['train_episodes']} | "
-                    f"train_ret={ep_return:+.4f} | "
-                    f"{selection_tag}={eval_m['eval_mean']:+.4f}±{eval_m['eval_std']:.4f} | "
-                    f"oracle={_oracle_mean:+.4f} cap={_oracle_capture*100:.1f}% | "
-                    f"alpha={log['alpha_values'][-1]:.4f} | "
-                    f"critic_loss={log['critic_losses'][-1]:.4f} | "
-                    f"SoC={eval_m['soc_end_mean']:.1f}/{eval_m['soc_min_mean']:.1f}MWh | "
-                    f"profit=${eval_m['profit_mean']:.0f} "
-                    f"(rev=${eval_m['revenue_mean']:.0f} deg=${eval_m['deg_cost_mean']:.0f}) | "
-                    f"dis={eval_m['frac_discharge']:.0%} ch={eval_m['frac_charge']:.0%} "
-                    f"idle={eval_m['frac_idle']:.0%} | "
-                    f"{elapsed:.0f}s{tag}"
-                )
+            _oracle_mean = oracle_eval["oracle_eval_mean"]
+            _oracle_capture = (
+                eval_m["eval_mean"] / _oracle_mean if _oracle_mean > 1e-8 else np.nan
+            )
+            print(
+                f"  Ep {ep:4d}/{hp['train_episodes']} | "
+                f"train_ret={ep_return:+.4f} | "
+                f"{selection_tag}={eval_m['eval_mean']:+.4f}±{eval_m['eval_std']:.4f} | "
+                f"oracle={_oracle_mean:+.4f} cap={_oracle_capture*100:.1f}% | "
+                f"alpha={log['alpha_values'][-1]:.4f} | "
+                f"critic={log['critic_losses'][-1]:.4f} actor={log['actor_losses'][-1]:.4f} | "
+                f"SoC={eval_m['soc_end_mean']:.1f}/{eval_m['soc_min_mean']:.1f}MWh | "
+                f"profit=${eval_m['profit_mean']:.0f} "
+                f"(rev=${eval_m['revenue_mean']:.0f} deg=${eval_m['deg_cost_mean']:.0f}) | "
+                f"dis={eval_m['frac_discharge']:.0%} ch={eval_m['frac_charge']:.0%} "
+                f"idle={eval_m['frac_idle']:.0%} | "
+                f"{elapsed:.0f}s{tag}"
+            )
 
             # --- Stop if patience exceeded ---
             if no_improve >= patience:
                 print(f"\n  Early stop at ep {ep}: no min_delta improvement on {selection_label} for "
                       f"{patience} evals. "
+                      f"True best eval={best_eval:+.4f} at ep {best_ep}.")
+                break
+
+            # --- Stop if degradation threshold exceeded ---
+            if degrade_patience > 0 and no_degrade >= degrade_patience:
+                print(f"\n  Early stop at ep {ep}: eval degraded "
+                      f"{best_eval - eval_m['eval_mean']:.4f} > {max_degradation:.4f} below best "
+                      f"for {degrade_patience} consecutive evals. "
                       f"True best eval={best_eval:+.4f} at ep {best_ep}.")
                 break
 
@@ -1635,9 +1698,6 @@ def train_sac(env: BESSEnv, hp: dict) -> tuple:
     log_path = os.path.join(run_dir, "training_log.npy")
     np.save(log_path, log, allow_pickle=True)
     print(f"\nTraining log saved -> {log_path}")
-    # Keep the legacy log path for downstream scripts.
-    legacy_path = os.path.join(OUTPUTS_DIR, "step4_training_log.npy")
-    np.save(legacy_path, log, allow_pickle=True)
 
     return agent, log
 
@@ -1703,7 +1763,11 @@ def main() -> None:
     print("=" * 65)
 
     # ---- Create environment ----
-    env = BESSEnv(seed=HP["seed"], validation_days=HP.get("validation_days", 30))
+    env = BESSEnv(
+        seed=HP["seed"],
+        validation_days=HP.get("validation_days", 30),
+        randomize_train_soc=bool(HP.get("randomize_train_soc", False)),
+    )
     _device_tag = "Metal GPU" if tf.config.get_visible_devices("GPU") else "CPU"
     print(f"RTS-GMLC 73-bus | BESS bus {env.bess_bus_rts} | TF 2.x {_device_tag}")
 

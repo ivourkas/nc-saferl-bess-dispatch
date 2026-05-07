@@ -22,15 +22,28 @@ RTS-GMLC/
 Literature/
 archive/
 
-# Generated outputs: keep only final exported agent
+# Local-only writing assets
+Reports/
+figures/
+SafeGrid_RL__*.pdf
+
+# Generated outputs: ignore by default, keep only current reproducibility artifacts
 outputs/*
-!outputs/step4_final/
-!outputs/step4_final/**
+!outputs/step1_*
+!outputs/step2_*
+!outputs/step5_final/
+!outputs/step5_final/**
+!outputs/paper_seed_sweep_20260506_5seeds/
+outputs/paper_seed_sweep_20260506_5seeds/*
+!outputs/paper_seed_sweep_20260506_5seeds/all_seed_summaries.json
+!outputs/paper_seed_sweep_20260506_5seeds/manifest.json
+!outputs/paper_seed_sweep_20260506_5seeds/figures/
+!outputs/paper_seed_sweep_20260506_5seeds/figures/**
+!outputs/paper_seed_sweep_20260506_5seeds/summary/
+!outputs/paper_seed_sweep_20260506_5seeds/summary/**
 
 # Other generated files
 *.ckpt
 *.log
-
-# Local/internal notes
-STEP4_SAC_DEEP_DIVE.md
-make_pptx.py
+overnight_rebuild.log
+five_seed_sweep.log

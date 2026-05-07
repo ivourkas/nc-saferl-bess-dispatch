@@ -1,0 +1,37 @@
+{
+  "config": {
+    "seed": 42,
+    "horizon": 24,
+    "k_neighbors": 20,
+    "time_limit_sec": 5.0,
+    "use_mode_binary": true,
+    "terminal_soc_target_mwh": 50.0,
+    "terminal_soc_penalty": 12.566359963160966,
+    "max_test_episodes": null,
+    "validation_days": 0,
+    "selection_forecast_train_end_hour": 6576,
+    "test_forecast_train_end_hour": 6576,
+    "forecast_policy": {
+      "pre_test_checks": "train_only_history",
+      "final_test": "full_causal_pre_test_history"
+    }
+  },
+  "metrics": {
+    "eval_mean": 16.152116280089793,
+    "eval_std": 9.722020239153538,
+    "eval_min": -3.5324512410213513,
+    "eval_max": 35.59276542651106,
+    "n_eval": 85,
+    "soc_end_mean": 60.931433216374565,
+    "soc_min_mean": 50.5452358522784,
+    "revenue_mean": 4971.274112832525,
+    "deg_cost_mean": 3356.062484823546,
+    "profit_mean": 1615.2116280089792,
+    "frac_discharge": 0.039075630252100826,
+    "frac_charge": 0.037464985994397744,
+    "frac_idle": 0.9234593837535015,
+    "clip_rate_mean": 0.017156862745098037,
+    "solve_failure_rate_mean": 0.001400560224089636
+  },
+  "n_episodes": 85
+}

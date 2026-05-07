@@ -191,6 +191,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("root", type=str, help="Seed sweep root produced by run_seed_sweep.py")
     parser.add_argument("--step5_metrics", type=str, default=str(DEFAULT_STEP5_METRICS),
                         help="Optional Step 5 metrics JSON to include as deterministic baseline.")
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=("step4", "step5"),
+        default=("step4", "step5"),
+        help="Subset of methods to include in the aggregated outputs.",
+    )
     return parser.parse_args()
 
 
@@ -198,13 +205,25 @@ def main() -> None:
     args = parse_args()
     root = Path(args.root).expanduser().resolve()
     summary_dir = root / "summary"
+    selected_methods = set(args.methods)
 
-    seed_summaries = _collect_seed_summaries(root)
+    seed_summaries = [
+        summary for summary in _collect_seed_summaries(root)
+        if summary["method"] in selected_methods
+    ]
+    if not seed_summaries and selected_methods != {"step5"}:
+        raise RuntimeError(
+            f"No matching seed_summary.json files found under {root} for methods {sorted(selected_methods)}"
+        )
     convergence_rows = _build_convergence_rows(seed_summaries)
     convergence_summary = _aggregate_convergence(convergence_rows)
 
     step5_path = Path(args.step5_metrics).expanduser().resolve()
-    step5_payload = _load_json(step5_path) if step5_path.exists() else None
+    step5_payload = (
+        _load_json(step5_path)
+        if step5_path.exists() and "step5" in selected_methods
+        else None
+    )
     final_rows = _build_final_rows(seed_summaries, step5_payload)
     final_summary = _aggregate_final(final_rows)
 
@@ -253,7 +272,6 @@ def main() -> None:
     paper_table = {
         "step4": next((row for row in final_summary if row["method"] == "step4"), None),
         "step5": next((row for row in final_summary if row["method"] == "step5"), None),
-        "step6": next((row for row in final_summary if row["method"] == "step6"), None),
     }
     _write_json(summary_dir / "paper_table.json", paper_table)
     _write_json(
@@ -261,6 +279,7 @@ def main() -> None:
         {
             "n_seed_runs": int(len(seed_summaries)),
             "step5_metrics_used": str(step5_path) if step5_payload is not None else None,
+            "methods": sorted(selected_methods),
         },
     )
 

@@ -1,86 +1,51 @@
 # NC-SafeRL for Grid-Constrained BESS Dispatch
 
-Research code for **network-constrained safe reinforcement learning (NC-SafeRL)** applied to battery energy storage system (BESS) dispatch on the **RTS-GMLC 73-bus** test system.
+Research code for network-constrained safe reinforcement learning (NC-SafeRL) for price-taking battery energy storage dispatch on the RTS-GMLC 73-bus system.
 
-The project couples:
-- DC-OPF-based locational marginal prices (LMPs),
-- PTDF-aware transmission constraints,
-- a Gymnasium environment with an exact 1D safety projection layer,
-- a Soft Actor-Critic (SAC) agent,
-- a causal rolling-horizon MPC/MILP baseline, and
-- a forecast-augmented SAC variant.
+## Active pipeline
 
-## What This Repository Contains
+- `1.Network.py`: build the RTS-GMLC network and export Step 1 artifacts.
+- `2.PrecomputeLMPs.py`: precompute yearly LMP, PTDF, and flow arrays.
+- `3.BESSEnvironment.py`: Gymnasium environment with SoC, degradation, and PTDF-aware safety.
+- `4.SACAgent.py`: reactive safe SAC training and evaluation.
+- `5.OptimizationBaseline.py`: causal 24-hour MPC/MILP baseline.
+- `scripts/run_seed_sweep.py`: fixed-budget Step 4 seed sweeps.
+- `scripts/aggregate_seed_sweep.py`: aggregate Step 4 / Step 5 outputs.
+- `scripts/plot_seed_sweep_ieee.py`: generate paper figures from aggregated summaries.
 
-- `1.Network.py`: builds the RTS-GMLC network in pandapower and exports Step-1 artifacts.
-- `2.PrecomputeLMPs.py`: computes yearly LMP/flow/PTDF arrays used during RL.
-- `3.BESSEnvironment.py`: Gymnasium environment with SoC, degradation, and safety-layer projection.
-- `4.SACAgent.py`: SAC training loop, replay buffer, evaluation, and checkpoints.
-- `5.OptimizationBaseline.py`: deterministic rolling-horizon MPC/MILP baseline with PTDF-aware bounds and Xu-style degradation.
-- `6.ForecastAugmentedSAC.py`: forecast-augmented SAC — same bounded architecture as Step 4 with causal price/SoC forecasts injected via an observation wrapper.
-- `scripts/`: utility scripts for seed sweeps and result aggregation/plotting.
+## Local-only assets
 
-## Data Policy
+The following stay local and are intentionally not versioned:
+- `Reports/`
+- top-level `figures/`
+- `RTS-GMLC/`
+- `Literature/`
 
-This repository **does not include dataset files**.  
-RTS-GMLC data should be obtained directly from the official source and cited accordingly.
-
-Dataset source:
-- https://github.com/GridMod/RTS-GMLC
-
-## Quick Start
-
-1. Clone this repository.
-2. Install dependencies.
-3. Place RTS-GMLC data in `RTS-GMLC/` (matching expected structure in the scripts).
-4. Run the pipeline in order:
+## Reproducible run order
 
 ```bash
 python 1.Network.py
 python 2.PrecomputeLMPs.py
-python 4.SACAgent.py          # reactive SAC
-python 5.OptimizationBaseline.py  # MPC/MILP baseline
-python 6.ForecastAugmentedSAC.py  # forecast-augmented SAC
+python 5.OptimizationBaseline.py --validation_days 0
+python scripts/run_seed_sweep.py --methods step4 --validation_days 0 --seeds 7 13 29 41 97 --train_episodes 3000 --eval_freq 200 --output_root outputs/paper_seed_sweep_20260506_5seeds
+python scripts/aggregate_seed_sweep.py outputs/paper_seed_sweep_20260506_5seeds --methods step4 step5
+python scripts/plot_seed_sweep_ieee.py outputs/paper_seed_sweep_20260506_5seeds --methods step4 step5
 ```
 
-`3.BESSEnvironment.py` is imported by Steps 4 and 6.
+## Tracked outputs
 
-## Typical Workflow
+This repo keeps only the current reproducibility artifacts under `outputs/`:
+- `step1_*`
+- `step2_*`
+- `step5_final/*`
+- `paper_seed_sweep_20260506_5seeds/*`
 
-1. **Network build (Step 1)**  
-   Creates the pandapower model and saves `outputs/step1_*`.
+## Dependencies
 
-2. **Offline OPF precomputation (Step 2)**  
-   Generates hourly LMPs, line flows, PTDF matrix, and metadata in `outputs/`.
+- `requirements.txt`: top-level, human-maintained dependency spec.
+- `requirements-lock.txt`: exact pinned environment snapshot used for reproducibility.
 
-3. **Safe RL training (Step 4 with Step 3 env)**  
-   Trains SAC on precomputed arrays with hard safety enforcement from PTDF + SoC bounds.
+## Data source
 
-4. **Deterministic baseline (Step 5)**  
-   Runs causal rolling-horizon MPC/MILP over the same episode, producing a comparable revenue/constraint-violation benchmark.
-
-5. **Forecast-augmented SAC (Step 6)**  
-   Extends Step 4 with the same causal forecasts used by Step 5, enabling a direct three-way comparison: reactive SAC vs. MPC vs. forecast-SAC.
-
-## Comparison Ladder
-
-| Step | Method | Forecasts |
-|------|--------|-----------|
-| 4 | Reactive SAC | None |
-| 5 | MPC / MILP baseline | Causal (historical analog) |
-| 6 | Forecast-augmented SAC | Causal (historical analog) |
-
-## Outputs
-
-Generated outputs are written to `outputs/`, including:
-- precomputed OPF arrays (`step2_*`),
-- training logs,
-- model checkpoints (`outputs/step4_checkpoints/`, `outputs/step6_checkpoints/`).
-
-These artifacts are excluded from version control by design.
-
-## Citation
-
-If you use this code, please cite:
-- this repository, and
-- the RTS-GMLC dataset source: https://github.com/GridMod/RTS-GMLC
+RTS-GMLC data should be obtained from the official source:
+- https://github.com/GridMod/RTS-GMLC

@@ -1,0 +1,8 @@
+{
+  "n_seed_runs": 5,
+  "step5_metrics_used": "/Users/yiannis/Library/CloudStorage/OneDrive-CUNY/Columbia/Advanced Reinforcement Learning/RL-Project/outputs/step5_final/mpc_baseline_metrics.json",
+  "methods": [
+    "step4",
+    "step5"
+  ]
+}

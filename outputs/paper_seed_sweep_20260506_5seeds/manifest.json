@@ -1,0 +1,25 @@
+{
+  "created_at": "2026-05-06 10:09:06",
+  "train_episodes": 3000,
+  "eval_freq": 200,
+  "validation_days": 0,
+  "selection_rule": "ma3",
+  "ptdf_enabled": true,
+  "methods": [
+    "step4"
+  ],
+  "seeds": [
+    7,
+    13,
+    29,
+    41,
+    97
+  ],
+  "oracle_val": {},
+  "oracle_test": {
+    "oracle_eval_mean": 22.50392457391306,
+    "oracle_eval_std": 8.361519093182505,
+    "oracle_profit_mean": 2250.392457391306,
+    "n_eval": 85
+  }
+}

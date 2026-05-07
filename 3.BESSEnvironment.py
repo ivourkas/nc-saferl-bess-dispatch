@@ -26,7 +26,7 @@ BESS_ETA_CH      = 0.95      # Charging efficiency (one-way)
 BESS_ETA_DIS     = 0.95      # Discharging efficiency (one-way)
 BESS_SOC_MIN     = 0.10      # Min SoC as fraction of E_cap
 BESS_SOC_MAX     = 0.90      # Max SoC as fraction of E_cap
-BESS_SOC_INIT    = 0.875     # Evaluation reset SoC
+BESS_SOC_INIT    = 0.875     # Canonical episode-start SoC (top of j=1 segment; cheap discharge available)
 
 # --- Degradation model — Xu et al. (2017), IEEE Trans. Power Systems ---
 # Phi(d) = BESS_PHI_XI * d^BESS_PHI_ALPHA   [Xu Eq. 24, NMC 18650 empirical fit]
@@ -44,6 +44,7 @@ LMP_NORM         = 100.0     # LMP normalization [$/MWh] (max observed ~$94)
 PV_MAX_MW        = 2500.0    # System PV normalization [MW]  (max observed ~2421)
 WIND_MAX_MW      = 2600.0    # Reference wind normalization [MW]
 REWARD_SCALE     = 0.01      # Reward scale used by the RL agent
+DISPATCH_DEADBAND_MW = 1.0   # Small dispatches are snapped to 0 MW to suppress churn
 
 # --- PTDF sensitivity threshold ---
 PTDF_THRESH      = 1e-5      # Lines with |PTDF| < thresh are treated as insensitive
@@ -107,9 +108,11 @@ class BESSEnv(gym.Env):
         episode_len:  int   = EPISODE_LEN,
         lmp_norm:     float = LMP_NORM,
         reward_scale: float = REWARD_SCALE,
+        dispatch_deadband_mw: float = DISPATCH_DEADBAND_MW,
         validation_days: int = VALIDATION_DAYS,
         seed:         Optional[int] = None,
         ptdf_enabled: bool = True,
+        randomize_train_soc: bool = False,
     ):
         super().__init__()
 
@@ -126,8 +129,10 @@ class BESSEnv(gym.Env):
         self.EPS_LEN   = episode_len
         self.LMP_NORM  = lmp_norm
         self.RWD_SCALE = reward_scale
+        self.DISPATCH_DEADBAND_MW = max(float(dispatch_deadband_mw), 0.0)
         self.validation_days = max(int(validation_days), 0)
         self.ptdf_enabled = bool(ptdf_enabled)
+        self.randomize_train_soc = bool(randomize_train_soc)
 
         # No terminal SoC salvage term is applied.
 
@@ -266,15 +271,16 @@ class BESSEnv(gym.Env):
         self.train_starts = _train
         self.val_starts = _val
         self.test_starts = _test
-        # When no val split exists, leave selection_starts empty so the training
-        # loop can switch to rolling training-return selection instead of falling
-        # back to test_starts (which would leak test data into checkpoint selection).
-        self.selection_starts = self.val_starts  # empty array when validation_days=0
-        self.selection_split_name = "validation" if len(self.val_starts) else "train_rolling"
+        # When no val split: use all training starts for checkpoint selection.
+        # Evaluating 262 training starts gives SEM≈0.62 (vs SEM≈2.0 for 24 val starts),
+        # and there is no val-test distribution mismatch. Overfitting risk is minimal
+        # in RL because the policy is a function of compact features, not episode identity.
+        self.selection_starts = self.val_starts if len(self.val_starts) > 0 else self.train_starts
+        self.selection_split_name = "validation" if len(self.val_starts) else "train_full"
         self._mode = "train"    # default: sample from training pool
 
         # Normalization constants from data
-        self.pv_max = float(np.nanmax(self.pv_total))  # for state normalization
+        self.pv_max = float(np.nanmax(self.pv_total[:self.test_start_hour]))  # train+val only
 
         # System total load across the three RTS areas.
         _ts_base = os.path.join(_HERE, "RTS-GMLC", "RTS_Data", "timeseries_data_files")
@@ -336,7 +342,7 @@ class BESSEnv(gym.Env):
             self.global_t = int(options["start_t"])
             self.soc      = self.SOC_INIT
         else:
-            # Randomize both start hour and initial SoC during training.
+            # Sample a chronological start from the active split.
             if self._mode == "test":
                 pool = self.test_starts
             elif self._mode == "val":
@@ -347,9 +353,13 @@ class BESSEnv(gym.Env):
                 raise RuntimeError(f"No episode starts available for mode={self._mode!r}.")
             idx  = self._np_rng.integers(0, len(pool))
             self.global_t = int(pool[idx])
-            soc_lo = self.SOC_MIN + 5.0   # 15 MWh  — small buffer above SOC_MIN
-            soc_hi = self.SOC_INIT        # 87.5 MWh — matches eval starting SoC
-            self.soc = float(self._np_rng.uniform(soc_lo, soc_hi))
+            if self._mode == "train" and self.randomize_train_soc:
+                soc_lo = self.SOC_MIN + 5.0   # 15 MWh  — small buffer above SOC_MIN
+                soc_hi = self.SOC_INIT        # 87.5 MWh — capped at the canonical start
+                self.soc = float(self._np_rng.uniform(soc_lo, soc_hi))
+            else:
+                # Default paper protocol: every episode starts from the same warm SoC.
+                self.soc = self.SOC_INIT
 
         self.step_in_ep  = 0
         self.lmp_history = np.zeros(24, dtype=np.float32)
@@ -380,7 +390,9 @@ class BESSEnv(gym.Env):
         p_hat = float(action[0]) * self.P_MAX
 
         # 2. Safety QP: project onto feasible set (analytical 1D clipping)
-        p_safe, p_lo, p_hi = self._safety_project(p_hat)
+        p_proj, p_lo, p_hi = self._safety_project(p_hat)
+        deadbanded = abs(p_proj) < self.DISPATCH_DEADBAND_MW
+        p_safe = 0.0 if deadbanded else p_proj
         # Snapshot PTDF bounds at the CURRENT timestep before _get_obs() advances global_t
         # and overwrites _ptdf_lo_last/_ptdf_hi_last with the next-step bounds.
         _ptdf_lo_snap = self._ptdf_lo_last
@@ -432,6 +444,7 @@ class BESSEnv(gym.Env):
 
         info = {
             "p_hat_mw":     p_hat,
+            "p_proj_mw":    p_proj,
             "p_safe_mw":    p_safe,
             "p_lo_mw":      p_lo,
             "p_hi_mw":      p_hi,
@@ -448,6 +461,7 @@ class BESSEnv(gym.Env):
             "revenue_$":    revenue,
             "deg_cost_$":   deg_cost,
             "reward_raw_$": revenue - deg_cost,
+            "deadbanded":   bool(deadbanded and abs(p_proj) > 1e-6),
             "clipped":      abs(p_safe - p_hat) > 1e-4,
             "global_hour":  self.global_t - 1,
         }
@@ -672,6 +686,7 @@ class BESSEnv(gym.Env):
             f"  Action dim:        {self.action_space.shape[0]}",
             f"  Episode length:    {self.EPS_LEN} steps (1 week)",
             f"  Reward scale:      {self.RWD_SCALE} (raw $/h -> scaled units)",
+            f"  Dispatch deadband: {self.DISPATCH_DEADBAND_MW:.1f} MW",
             f"  PTDF safety layer: {'ENABLED' if self.ptdf_enabled else 'DISABLED (ablation — violations tracked in info[ptdf_violated])'}",
             "=" * 65,
         ]

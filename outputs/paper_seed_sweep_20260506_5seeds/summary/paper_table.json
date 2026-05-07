@@ -1,0 +1,24 @@
+{
+  "step4": {
+    "method": "step4",
+    "n_runs": 5,
+    "test_eval_mean_mean": 17.803417981567232,
+    "test_eval_mean_std": 0.21150203228833314,
+    "test_profit_mean_mean": 1780.3417981567231,
+    "test_profit_mean_std": 21.150203228833558,
+    "test_eval_std_mean": 7.387582711136297,
+    "worst_week_mean": 3.044619483934132,
+    "avg_train_minutes": 36.24332910219828
+  },
+  "step5": {
+    "method": "step5",
+    "n_runs": 1,
+    "test_eval_mean_mean": 16.152116280089793,
+    "test_eval_mean_std": 0.0,
+    "test_profit_mean_mean": 1615.2116280089792,
+    "test_profit_mean_std": 0.0,
+    "test_eval_std_mean": 9.722020239153538,
+    "worst_week_mean": -3.5324512410213513,
+    "avg_train_minutes": 0.0
+  }
+}
